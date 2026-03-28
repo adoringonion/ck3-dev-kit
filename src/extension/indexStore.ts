@@ -63,7 +63,6 @@ export class IndexStore {
       const relevant = records
         .filter((symbol) => symbolMatchesCompletionKinds(symbol.kind, kinds))
         .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
-
       if (relevant.length === 0) {
         continue;
       }
@@ -106,22 +105,13 @@ export class IndexStore {
     });
   }
 
-  async parsedDocument(uri: vscode.Uri): Promise<ParsedDocument | undefined> {
-    const live = this.liveDocuments.get(path.resolve(uri.fsPath));
-    if (live) {
-      return live.parsed;
-    }
-    const index = await this.ensure();
-    return index.documents.get(uri.fsPath);
-  }
-
   syncTextDocument(document: vscode.TextDocument): void {
     if (!matchesCk3Path(document.fileName)) {
       this.liveDocuments.delete(path.resolve(document.fileName));
       return;
     }
 
-    const source = resolveDocumentSource(document.uri.fsPath);
+    const source = resolveConfiguredSource(document.uri.fsPath, readConfig());
     if (!source) {
       this.liveDocuments.delete(path.resolve(document.fileName));
       return;
@@ -212,10 +202,6 @@ function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: strin
 
 function extractSymbolsForValidation(filePath: string, parsed: ParsedDocument, source: "mod" | "reference"): SymbolRecord[] {
   return createDocumentIndexRecord(filePath, parsed.text, source).symbols;
-}
-
-function resolveDocumentSource(filePath: string): "mod" | "reference" | null {
-  return resolveConfiguredSource(filePath, readConfig());
 }
 
 function matchesCk3Path(fileName: string): boolean {

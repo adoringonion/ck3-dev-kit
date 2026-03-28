@@ -1,24 +1,47 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
 import { LanguageClient } from "vscode-languageclient/node";
+import { buildCachedWorkspaceIndex } from "./cli-shared";
 import { analyzeErrorLogFile } from "./core/errorLog";
 import { IndexStore } from "./extension/indexStore";
+import { registerProviders } from "./extension/providers";
 import { writeWorkspaceAssociations } from "./extension/workspaceSettings";
 import { readConfig } from "./extension/config";
 import { createLanguageClient } from "./lsp/client";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const store = new IndexStore();
+  const fallbackStore = new IndexStore();
   const output = vscode.window.createOutputChannel("CK3 Mod DevKit");
-  let rebuildTimer: NodeJS.Timeout | undefined;
   let languageClient: LanguageClient | undefined;
+  let usingFallback = false;
+  let fallbackProviders: vscode.Disposable | undefined;
   context.subscriptions.push(output);
+
+  const enableFallback = () => {
+    if (usingFallback) {
+      return;
+    }
+    fallbackProviders = registerProviders(context, fallbackStore);
+    usingFallback = true;
+  };
+
+  const disableFallback = () => {
+    if (!usingFallback) {
+      return;
+    }
+    fallbackProviders?.dispose();
+    fallbackProviders = undefined;
+    usingFallback = false;
+  };
 
   const startLanguageServer = async () => {
     const nextClient = createLanguageClient(context, readConfig(), output);
     context.subscriptions.push(nextClient);
+    output.appendLine(`[${new Date().toISOString()}] Starting language server.`);
     await nextClient.start();
     languageClient = nextClient;
+    disableFallback();
+    output.appendLine(`[${new Date().toISOString()}] Language server started.`);
   };
 
   const restartLanguageServer = async () => {
@@ -32,12 +55,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const rebuildIndex = async (reason: string, notify = false) => {
     try {
       output.appendLine(`[${new Date().toISOString()}] Rebuilding index: ${reason}`);
-      await store.rebuild();
       if (languageClient) {
         await languageClient.sendNotification("ck3/rebuildIndex");
-      }
-      for (const document of vscode.workspace.textDocuments) {
-        store.syncTextDocument(document);
+      } else if (usingFallback) {
+        await fallbackStore.rebuild();
+        output.appendLine(`[${new Date().toISOString()}] Fallback index rebuilt.`);
+      } else {
+        output.appendLine(`[${new Date().toISOString()}] No active language backend to rebuild.`);
       }
       output.appendLine(`[${new Date().toISOString()}] Index rebuild complete.`);
       if (notify) {
@@ -51,18 +75,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
-  const scheduleRebuild = (reason: string, notify = false, delayMs = 250) => {
-    if (rebuildTimer) {
-      clearTimeout(rebuildTimer);
-    }
-    rebuildTimer = setTimeout(() => {
-      rebuildTimer = undefined;
-      void rebuildIndex(reason, notify);
-    }, delayMs);
-  };
-
   void promptForWorkspaceAssociations();
-  await startLanguageServer();
+  try {
+    await startLanguageServer();
+  } catch (error) {
+    const message = error instanceof Error ? error.stack ?? error.message : String(error);
+    output.appendLine(`[${new Date().toISOString()}] Language server failed to start. Falling back to direct providers.`);
+    output.appendLine(message);
+    enableFallback();
+    void vscode.window.showWarningMessage("CK3 Mod DevKit language server failed to start. Using fallback providers.");
+  }
 
   context.subscriptions.push(
     vscode.commands.registerCommand("ck3ModDevkit.associateWorkspace", async () => {
@@ -78,7 +100,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
-      const index = await store.snapshot();
+      const index = buildCachedWorkspaceIndex(config);
       const analysis = analyzeErrorLogFile({
         logPath: config.errorLogPath,
         modRoots: config.modRoots,
@@ -110,8 +132,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.workspace.onDidChangeConfiguration(async (event) => {
       if (event.affectsConfiguration("ck3ModDevkit")) {
-        scheduleRebuild("configuration change");
-        await restartLanguageServer();
+        try {
+          await restartLanguageServer();
+        } catch (error) {
+          const message = error instanceof Error ? error.stack ?? error.message : String(error);
+          output.appendLine(`[${new Date().toISOString()}] Language server restart failed.`);
+          output.appendLine(message);
+          enableFallback();
+        }
+        await rebuildIndex("configuration change");
       }
     })
   );

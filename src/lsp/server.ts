@@ -1,36 +1,57 @@
 import {
+  CodeAction,
   CompletionItem,
-  CompletionItemKind,
   CompletionParams,
   createConnection,
   Definition,
   Diagnostic,
   DiagnosticSeverity,
+  DocumentDiagnosticReport,
+  DocumentDiagnosticReportKind,
+  FullDocumentDiagnosticReport,
   Hover,
   InitializeParams,
   InitializeResult,
+  InlayHint,
   Location,
   MarkupKind,
   Position,
+  PrepareRenameParams,
   Range,
   ReferenceParams,
+  RenameParams,
+  SemanticTokens,
   SymbolInformation,
-  SymbolKind,
   TextDocumentSyncKind,
   TextDocuments,
+  WorkspaceDiagnosticReport,
   WorkspaceSymbolParams,
+  WorkspaceEdit,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import * as path from "path";
 import { pathToFileURL } from "url";
 import { createDocumentIndexRecord, WorkspaceIndex } from "../core/indexer";
-import { validateParsedDocumentAgainstIndex } from "../core/references";
+import { validateParsedDocumentAgainstIndex, validateReferences } from "../core/references";
 import { parseDocumentText } from "../core/document";
-import { scalarValue } from "../core/parser";
 import { ParsedDocument, AssignmentNode, ReferenceRecord, SymbolRecord } from "../core/types";
 import { buildCachedWorkspaceIndex } from "../cli-shared";
 import { getScriptSyntaxHelp, SyntaxHelpContext } from "../extension/dynamicReferenceHelp";
 import { inferCompletionContext } from "../extension/completion";
+import {
+  buildDocumentDiagnosticReport,
+  buildInlayHints,
+  buildRenameWorkspaceEdit,
+  buildSemanticTokens,
+  completionDocumentation,
+  createMissingLocalizationCodeAction,
+  describeEntry,
+  SEMANTIC_TOKEN_TYPES,
+  toCompletionItemKind,
+  toLspRange,
+  toSymbolKind,
+  toWorkspaceSymbol,
+} from "./features";
 
 type SourceKind = "mod" | "reference";
 
@@ -77,6 +98,22 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       },
       documentSymbolProvider: true,
       workspaceSymbolProvider: true,
+      renameProvider: {
+        prepareProvider: true,
+      },
+      codeActionProvider: true,
+      inlayHintProvider: true,
+      semanticTokensProvider: {
+        legend: {
+          tokenTypes: [...SEMANTIC_TOKEN_TYPES],
+          tokenModifiers: [],
+        },
+        full: true,
+      },
+      diagnosticProvider: {
+        interFileDependencies: false,
+        workspaceDiagnostics: true,
+      },
     },
   };
 });
@@ -177,7 +214,7 @@ connection.onCompletion(({ textDocument, position }: CompletionParams): Completi
   const symbols = completionSymbols(context.kinds, context.query);
   return symbols.map((symbol) => ({
     label: context.prefix ? `${context.prefix}${symbol.name}` : symbol.name,
-    kind: toCompletionItemKind(symbol),
+    kind: toCompletionItemKind(symbol.kind),
     detail: `${symbol.kind} (${symbol.source})`,
     documentation: {
       kind: MarkupKind.Markdown,
@@ -208,10 +245,10 @@ connection.onDocumentSymbol(({ textDocument }) => {
       name: entry.key,
       detail: describeEntry(entry),
       kind: entry.key === "namespace"
-        ? SymbolKind.Namespace
+        ? toSymbolKind("namespace")
         : looksLikeEventId(entry.key)
-          ? SymbolKind.Event
-          : SymbolKind.Object,
+          ? toSymbolKind("event")
+          : toSymbolKind("definition"),
       range: toLspRange(entry.range),
       selectionRange: toLspRange(entry.keyRange),
     }));
@@ -220,12 +257,112 @@ connection.onDocumentSymbol(({ textDocument }) => {
 connection.onWorkspaceSymbol(({ query }: WorkspaceSymbolParams): SymbolInformation[] => {
   return allSymbols(query)
     .filter((symbol) => symbol.kind !== "localization-reference")
-    .map((symbol) => ({
-      name: symbol.name,
-      kind: toSymbolKind(symbol),
-      location: toLocation(symbol),
-      containerName: symbol.containerName ?? "",
-    }));
+    .map((symbol) => toWorkspaceSymbol(symbol) as SymbolInformation);
+});
+
+connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams) => {
+  const document = documents.get(textDocument.uri);
+  if (!document) {
+    return null;
+  }
+  const wordRange = findWordRange(document, position);
+  if (!wordRange) {
+    return null;
+  }
+  const name = document.getText(wordRange);
+  const targetKind = targetRenameKind(document.uri, wordRange, name);
+  if (!targetKind) {
+    return null;
+  }
+  return {
+    range: wordRange,
+    placeholder: name,
+  };
+});
+
+connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): WorkspaceEdit | null => {
+  const document = documents.get(textDocument.uri);
+  if (!document) {
+    return null;
+  }
+  const wordRange = findWordRange(document, position);
+  if (!wordRange) {
+    return null;
+  }
+  const name = document.getText(wordRange);
+  const targetKind = targetRenameKind(document.uri, wordRange, name);
+  if (!targetKind) {
+    return null;
+  }
+  const symbols = symbolsByName(name).filter((symbol) => renameCompatibleSymbolKind(symbol.kind, targetKind));
+  const references = referencesByName(name).filter((reference) => renameCompatibleReferenceKind(reference.kind, targetKind));
+  if (symbols.length === 0 && references.length === 0) {
+    return null;
+  }
+  return buildRenameWorkspaceEdit(newName, symbols, references);
+});
+
+connection.onCodeAction((params): CodeAction[] => {
+  const actions: CodeAction[] = [];
+  for (const diagnostic of params.context.diagnostics) {
+    const unresolvedLocalization = diagnostic.message.match(/^Unresolved localization reference: ([\w.:-]+)$/);
+    if (!unresolvedLocalization) {
+      continue;
+    }
+    const action = createMissingLocalizationCodeAction(
+      diagnostic,
+      unresolvedLocalization[1],
+      preferredLocalizationFile()
+    );
+    if (action) {
+      actions.push(action);
+    }
+  }
+  return actions;
+});
+
+connection.languages.inlayHint.on(({ textDocument }): InlayHint[] => {
+  const document = documents.get(textDocument.uri);
+  if (!document) {
+    return [];
+  }
+  const parsed = parseDocumentText(uriToFsPath(document.uri), document.getText());
+  return buildInlayHints(parsed, uriToFsPath(document.uri), allSymbols());
+});
+
+connection.languages.semanticTokens.on(({ textDocument }): SemanticTokens => {
+  const document = documents.get(textDocument.uri);
+  if (!document) {
+    return { data: [] };
+  }
+  const parsed = parseDocumentText(uriToFsPath(document.uri), document.getText());
+  return buildSemanticTokens(parsed);
+});
+
+connection.languages.diagnostics.on((params): DocumentDiagnosticReport => {
+  const document = documents.get(params.textDocument.uri);
+  if (!document) {
+    return {
+      kind: DocumentDiagnosticReportKind.Full,
+      items: [],
+    };
+  }
+  return buildDocumentDiagnosticReport(collectDocumentDiagnostics(document));
+});
+
+connection.languages.diagnostics.onWorkspace((): WorkspaceDiagnosticReport => {
+  const items = Array.from(index.documents.entries())
+    .map(([filePath, parsed]) => {
+      const diagnostics = collectValidationDiagnostics(parsed, filePath);
+      return {
+        kind: DocumentDiagnosticReportKind.Full,
+        uri: pathToFileURL(filePath).toString(),
+        version: null,
+        items: diagnostics,
+      } as FullDocumentDiagnosticReport & { uri: string; version: null };
+    })
+    .filter((entry) => entry.items.length > 0);
+  return { items };
 });
 
 connection.onNotification("ck3/rebuildIndex", () => {
@@ -284,19 +421,30 @@ function syncDocument(document: TextDocument): void {
 }
 
 function publishDiagnostics(document: TextDocument): void {
-  const live = liveDocuments.get(document.uri);
-  if (!live) {
-    connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
-    return;
-  }
+  connection.sendDiagnostics({
+    uri: document.uri,
+    diagnostics: collectDocumentDiagnostics(document),
+  });
+}
 
-  const overlayedSymbols = overlaySymbols(document.uri, live.symbols);
-  const validation = validateParsedDocumentAgainstIndex(live.parsed, {
+function collectDocumentDiagnostics(document: TextDocument): Diagnostic[] {
+  const filePath = uriToFsPath(document.uri);
+  const live = liveDocuments.get(document.uri) ?? {
+    ...createDocumentIndexRecord(filePath, document.getText(), resolveSource(filePath)),
+    source: resolveSource(filePath),
+  };
+  return collectValidationDiagnostics(live.parsed, filePath);
+}
+
+function collectValidationDiagnostics(parsed: ParsedDocument, filePath: string): Diagnostic[] {
+  const liveSymbols = createDocumentIndexRecord(filePath, parsed.text, resolveSource(filePath)).symbols;
+  const overlayedSymbols = overlaySymbols(pathToFileURL(filePath).toString(), liveSymbols);
+  const validation = validateParsedDocumentAgainstIndex(parsed, {
     ...index,
     symbols: overlayedSymbols,
   });
 
-  const diagnostics: Diagnostic[] = validation.map((entry) => ({
+  return validation.map((entry) => ({
     severity:
       entry.severity === "error"
         ? DiagnosticSeverity.Error
@@ -307,11 +455,6 @@ function publishDiagnostics(document: TextDocument): void {
     range: toLspRange(entry.range),
     source: "ck3-devkit",
   }));
-
-  connection.sendDiagnostics({
-    uri: document.uri,
-    diagnostics,
-  });
 }
 
 function overlaySymbols(documentUri: string, symbols: SymbolRecord[]): Map<string, SymbolRecord[]> {
@@ -420,29 +563,108 @@ function completionSymbols(kinds: string[], query = "", limit = 100): SymbolReco
   return matches.slice(0, limit);
 }
 
-function findWordRange(document: TextDocument, position: Position): Range | null {
-  const text = document.getText();
-  const offset = document.offsetAt(position);
-  const isWord = (char: string) => /[\w.:-]/.test(char);
-
-  let start = offset;
-  while (start > 0 && isWord(text[start - 1])) {
-    start -= 1;
+function targetRenameKind(documentUri: string, range: Range, name: string): string | null {
+  const filePath = uriToFsPath(documentUri);
+  const live = liveDocuments.get(documentUri);
+  const symbols = (live?.symbols ?? []).filter((symbol) =>
+    symbol.name === name &&
+    symbol.range.start.line === range.start.line &&
+    symbol.range.start.character === range.start.character
+  );
+  if (symbols.length > 0) {
+    return symbols[0].kind;
   }
 
-  let end = offset;
-  while (end < text.length && isWord(text[end])) {
-    end += 1;
+  const baseSymbols = (index.symbols.get(name) ?? []).filter((symbol) =>
+    symbol.path === filePath &&
+    symbol.range.start.line === range.start.line &&
+    symbol.range.start.character === range.start.character
+  );
+  if (baseSymbols.length > 0) {
+    return baseSymbols[0].kind;
   }
 
-  if (start === end) {
-    return null;
+  const references = (live?.references ?? []).filter((reference) =>
+    reference.name === name &&
+    reference.range.start.line === range.start.line &&
+    reference.range.start.character === range.start.character
+  );
+  if (references.length > 0) {
+    return normalizeRenameKind(references[0].kind);
   }
 
-  return {
-    start: document.positionAt(start),
-    end: document.positionAt(end),
-  };
+  const baseReferences = (index.references.get(name) ?? []).filter((reference) =>
+    reference.path === filePath &&
+    reference.range.start.line === range.start.line &&
+    reference.range.start.character === range.start.character
+  );
+  if (baseReferences.length > 0) {
+    return normalizeRenameKind(baseReferences[0].kind);
+  }
+
+  return null;
+}
+
+function normalizeRenameKind(kind: string): string {
+  if (
+    kind === "character_modifier" ||
+    kind === "county_modifier" ||
+    kind === "province_modifier" ||
+    kind === "artifact_modifier"
+  ) {
+    return "modifier";
+  }
+  return kind;
+}
+
+function renameCompatibleSymbolKind(symbolKind: string, targetKind: string): boolean {
+  const normalized = normalizeRenameKind(symbolKind);
+  return normalized === targetKind;
+}
+
+function renameCompatibleReferenceKind(referenceKind: string, targetKind: string): boolean {
+  const normalized = normalizeRenameKind(referenceKind);
+  if (targetKind === "religion" && normalized === "faith") {
+    return true;
+  }
+  if (targetKind === "faith" && normalized === "religion") {
+    return true;
+  }
+  return normalized === targetKind;
+}
+
+function preferredLocalizationFile(): string | null {
+  for (const root of config.modRoots) {
+    const folder = path.join(root, "localization");
+    if (!fsExists(folder)) {
+      continue;
+    }
+    const files = walkFiles(folder).filter((file) => file.toLowerCase().endsWith(".yml"));
+    if (files.length > 0) {
+      return files.sort()[0];
+    }
+  }
+  return null;
+}
+
+function walkFiles(root: string): string[] {
+  const results: string[] = [];
+  const queue = [root];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const stat = safeStat(current);
+    if (!stat) {
+      continue;
+    }
+    if (stat.isDirectory()) {
+      for (const child of safeReadDir(current)) {
+        queue.push(path.join(current, child));
+      }
+      continue;
+    }
+    results.push(current);
+  }
+  return results;
 }
 
 function syntaxHelpContextAt(parsed: ParsedDocument, range: Range): SyntaxHelpContext | undefined {
@@ -481,17 +703,36 @@ function sameRange(
     && left.end.character === right.end.character;
 }
 
-function toLspRange(range: { start: { line: number; character: number }; end: { line: number; character: number } }): Range {
+function findWordRange(document: TextDocument, position: Position): Range | null {
+  const text = document.getText();
+  const offset = document.offsetAt(position);
+  const isWord = (char: string) => /[\w.:-]/.test(char);
+
+  let start = offset;
+  while (start > 0 && isWord(text[start - 1])) {
+    start -= 1;
+  }
+
+  let end = offset;
+  while (end < text.length && isWord(text[end])) {
+    end += 1;
+  }
+
+  if (start === end) {
+    return null;
+  }
+
   return {
-    start: {
-      line: range.start.line,
-      character: range.start.character,
-    },
-    end: {
-      line: range.end.line,
-      character: range.end.character,
-    },
+    start: document.positionAt(start),
+    end: document.positionAt(end),
   };
+}
+
+function recentDocumentText(document: TextDocument, position: Position): string {
+  const startLine = Math.max(position.line - 6, 0);
+  const start = document.offsetAt({ line: startLine, character: 0 });
+  const end = document.offsetAt(position);
+  return document.getText().slice(start, end);
 }
 
 function toLocation(symbol: SymbolRecord): Location {
@@ -508,13 +749,6 @@ function toReferenceLocation(reference: ReferenceRecord): Location {
   };
 }
 
-function recentDocumentText(document: TextDocument, position: Position): string {
-  const startLine = Math.max(position.line - 6, 0);
-  const start = document.offsetAt({ line: startLine, character: 0 });
-  const end = document.offsetAt(position);
-  return document.getText().slice(start, end);
-}
-
 function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: string[]): boolean {
   return completionKinds.some((kind) => {
     if (kind === "character_modifier" || kind === "county_modifier" || kind === "province_modifier" || kind === "artifact_modifier") {
@@ -522,87 +756,6 @@ function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: strin
     }
     return symbolKind === kind;
   });
-}
-
-function toSymbolKind(symbol: SymbolRecord): SymbolKind {
-  switch (symbol.kind) {
-    case "namespace":
-      return SymbolKind.Namespace;
-    case "event":
-      return SymbolKind.Event;
-    case "scripted_effect":
-    case "scripted_trigger":
-      return SymbolKind.Function;
-    case "script_value":
-      return SymbolKind.Variable;
-    case "decision":
-      return SymbolKind.Method;
-    case "modifier":
-      return SymbolKind.Constant;
-    case "trait":
-      return SymbolKind.EnumMember;
-    case "culture":
-    case "faith":
-    case "religion":
-      return SymbolKind.Class;
-    case "cultural_tradition":
-    case "cultural_pillar":
-    case "doctrine":
-      return SymbolKind.Enum;
-    case "localization":
-      return SymbolKind.String;
-    default:
-      return SymbolKind.Object;
-  }
-}
-
-function toCompletionItemKind(symbol: SymbolRecord): CompletionItemKind {
-  switch (symbol.kind) {
-    case "event":
-      return CompletionItemKind.Event;
-    case "localization":
-      return CompletionItemKind.Text;
-    case "scripted_effect":
-    case "scripted_trigger":
-      return CompletionItemKind.Function;
-    case "script_value":
-      return CompletionItemKind.Variable;
-    case "trait":
-    case "doctrine":
-    case "doctrine_parameter":
-    case "cultural_tradition":
-    case "cultural_pillar":
-      return CompletionItemKind.EnumMember;
-    case "modifier":
-      return CompletionItemKind.Constant;
-    case "culture":
-    case "faith":
-    case "religion":
-      return CompletionItemKind.Class;
-    case "artifact_type":
-    case "artifact_template":
-    case "artifact_visual":
-      return CompletionItemKind.Value;
-    default:
-      return CompletionItemKind.Value;
-  }
-}
-
-function completionDocumentation(symbol: SymbolRecord): string {
-  const container = symbol.containerName ? `\n\nContainer: \`${symbol.containerName}\`` : "";
-  return `**${symbol.name}**\n\nType: \`${symbol.kind}\`\n\nSource: \`${symbol.source}\`\n\nPath: \`${symbol.path}\`${container}`;
-}
-
-function describeEntry(entry: AssignmentNode): string {
-  const value = scalarValue(entry.value);
-  if (value) {
-    return value;
-  }
-  return entry.value.kind;
-}
-
-function looksLikeEventId(name: string): boolean {
-  return /^[a-zA-Z0-9_]+\.\d+$/.test(name);
 }
 
 function matchesCk3Path(uri: string): boolean {
@@ -622,4 +775,32 @@ function uriToFsPath(uri: string): string {
     return pathname.slice(1);
   }
   return path.normalize(pathname);
+}
+
+function looksLikeEventId(name: string): boolean {
+  return /^[a-zA-Z0-9_]+\.\d+$/.test(name);
+}
+
+function fsExists(filePath: string): boolean {
+  try {
+    return require("fs").existsSync(filePath);
+  } catch {
+    return false;
+  }
+}
+
+function safeStat(filePath: string) {
+  try {
+    return require("fs").statSync(filePath);
+  } catch {
+    return null;
+  }
+}
+
+function safeReadDir(filePath: string): string[] {
+  try {
+    return require("fs").readdirSync(filePath);
+  } catch {
+    return [];
+  }
 }

@@ -29,6 +29,7 @@ export function createLanguageClient(
     ],
     initializationOptions: config,
     outputChannel,
+    traceOutputChannel: outputChannel,
   };
 
   return new LanguageClient("ck3ModDevkitLsp", "CK3 Mod DevKit Language Server", serverOptions, clientOptions);
