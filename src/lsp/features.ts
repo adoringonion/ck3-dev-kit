@@ -10,7 +10,6 @@ import {
   DocumentDiagnosticReportKind,
   FullDocumentDiagnosticReport,
   InlayHint,
-  MarkupKind,
   OptionalVersionedTextDocumentIdentifier,
   Position,
   Range,
@@ -197,6 +196,61 @@ export function createAddUtf8BomCodeAction(diagnostic: Diagnostic, documentUri: 
   };
 }
 
+export function createConvertGuiTextToRawTextCodeAction(
+  diagnostic: Diagnostic,
+  documentUri: string,
+  symbolName: string,
+  line: number,
+  keyStart: number,
+  keyEnd: number,
+  valueStart: number,
+  valueEnd: number
+): CodeAction {
+  return {
+    title: `Convert text to raw_text for '${symbolName}'`,
+    kind: CodeActionKind.QuickFix,
+    diagnostics: [diagnostic],
+    edit: {
+      changes: {
+        [documentUri]: [
+          {
+            range: {
+              start: { line, character: keyStart },
+              end: { line, character: keyEnd },
+            },
+            newText: "raw_text",
+          },
+          {
+            range: {
+              start: { line, character: valueStart },
+              end: { line, character: valueEnd },
+            },
+            newText: `"${symbolName}"`,
+          },
+        ],
+      },
+    },
+  };
+}
+
+export function createMissingEventCodeAction(
+  diagnostic: Diagnostic,
+  eventId: string,
+  filePath: string | null
+): CodeAction | null {
+  if (!filePath) {
+    return null;
+  }
+  const namespace = eventId.includes(".") ? eventId.split(".")[0] : "generated";
+  const stub = `namespace = ${namespace}\n\n${eventId} = {\n}\n`;
+  return {
+    title: `Create event '${eventId}'`,
+    kind: CodeActionKind.QuickFix,
+    diagnostics: [diagnostic],
+    edit: appendOrCreateWorkspaceEdit(filePath, stub),
+  };
+}
+
 export function toWorkspaceSymbol(symbol: SymbolRecord): WorkspaceSymbol {
   return {
     name: symbol.name,
@@ -240,6 +294,49 @@ export function toCompletionItemKind(symbolKind: string): CompletionItemKind {
 export function completionDocumentation(symbol: SymbolRecord): string {
   const container = symbol.containerName ? `\n\nContainer: \`${symbol.containerName}\`` : "";
   return `**${symbol.name}**\n\nType: \`${symbol.kind}\`\n\nSource: \`${symbol.source}\`\n\nPath: \`${symbol.path}\`${container}`;
+}
+
+export function buildHoverMarkdown(
+  symbol: SymbolRecord,
+  referenceCount: number,
+  definitionCount: number,
+  snippet?: string,
+  localizationText?: string,
+  localizationLanguage?: string | null
+): string {
+  const lines = [
+    `**${symbol.name}**`,
+    "",
+    `Type: \`${symbol.kind}\``,
+    `Source: \`${symbol.source}\``,
+  ];
+
+  if (localizationText) {
+    lines.push("");
+    lines.push(`Text: "${escapeInlineQuote(localizationText)}"`);
+    if (localizationLanguage) {
+      lines.push(`Language: \`${localizationLanguage}\``);
+    }
+  }
+
+  if (symbol.containerName) {
+    lines.push(`Container: \`${symbol.containerName}\``);
+  }
+
+  lines.push(`Definitions: \`${definitionCount}\``);
+  lines.push(`References: \`${referenceCount}\``);
+  lines.push(`Location: \`${path.basename(symbol.path)}:${symbol.range.start.line + 1}\``);
+  lines.push("");
+  lines.push(`Path: \`${symbol.path}\``);
+
+  if (snippet) {
+    lines.push("");
+    lines.push("```ck3-script");
+    lines.push(snippet);
+    lines.push("```");
+  }
+
+  return lines.join("\n");
 }
 
 export function toSymbolKind(symbolKind: string): SymbolKind {
@@ -387,6 +484,10 @@ function scriptDefinitionStub(
     default:
       return null;
   }
+}
+
+function escapeInlineQuote(value: string): string {
+  return value.replace(/"/g, "\\\"");
 }
 
 function pushRegexTokens(

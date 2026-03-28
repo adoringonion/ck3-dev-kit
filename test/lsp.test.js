@@ -7,9 +7,12 @@ const path = require("node:path");
 const { parseScript } = require("../dist/core/parser");
 const {
   buildDocumentDiagnosticReport,
+  buildHoverMarkdown,
   buildRenameWorkspaceEdit,
   buildSemanticTokens,
   createAddUtf8BomCodeAction,
+  createConvertGuiTextToRawTextCodeAction,
+  createMissingEventCodeAction,
   createMissingScriptDefinitionCodeAction,
   createMissingLocalizationCodeAction,
   SEMANTIC_TOKEN_TYPES,
@@ -74,6 +77,55 @@ test("buildRenameWorkspaceEdit rewrites symbols and references", () => {
   );
 
   assert.equal(Object.keys(edit.changes).length, 2);
+});
+
+test("buildHoverMarkdown includes symbol metadata and snippet", () => {
+  const markdown = buildHoverMarkdown(
+    {
+      name: "medium_prestige_value",
+      kind: "script_value",
+      path: "D:/game/common/script_values/00_basic_values.txt",
+      range: {
+        start: { line: 10, character: 0, offset: 100 },
+        end: { line: 10, character: 21, offset: 121 },
+      },
+      containerName: "script_values",
+      source: "reference",
+    },
+    12,
+    2,
+    "medium_prestige_value = 350"
+  );
+
+  assert.match(markdown, /\*\*medium_prestige_value\*\*/);
+  assert.match(markdown, /Type: `script_value`/);
+  assert.match(markdown, /Definitions: `2`/);
+  assert.match(markdown, /References: `12`/);
+  assert.match(markdown, /00_basic_values\.txt:11/);
+  assert.match(markdown, /```ck3-script/);
+});
+
+test("buildHoverMarkdown includes localization text when present", () => {
+  const markdown = buildHoverMarkdown(
+    {
+      name: "sample_key",
+      kind: "localization",
+      path: "D:/mod/localization/english/sample_l_english.yml",
+      range: {
+        start: { line: 2, character: 1, offset: 20 },
+        end: { line: 2, character: 11, offset: 30 },
+      },
+      source: "mod",
+    },
+    3,
+    1,
+    "sample_key:0 \"Sample text\"",
+    "Sample text",
+    "l_english"
+  );
+
+  assert.match(markdown, /Text: "Sample text"/);
+  assert.match(markdown, /Language: `l_english`/);
 });
 
 test("createMissingLocalizationCodeAction inserts a loc stub", () => {
@@ -143,6 +195,55 @@ test("createAddUtf8BomCodeAction inserts a BOM at the file start", () => {
 
   assert.equal(action.title, "Add UTF-8 BOM");
   assert.equal(action.edit.changes["file:///D:/mod/localization/english/sample_l_english.yml"][0].newText, "\uFEFF");
+});
+
+test("createConvertGuiTextToRawTextCodeAction rewrites text assignments", () => {
+  const action = createConvertGuiTextToRawTextCodeAction(
+    {
+      range: {
+        start: { line: 4, character: 2 },
+        end: { line: 4, character: 18 },
+      },
+      message: "Unresolved localization reference: literal_text",
+    },
+    "file:///D:/mod/gui/sample.gui",
+    "literal_text",
+    4,
+    2,
+    6,
+    9,
+    21
+  );
+
+  assert.equal(action.edit.changes["file:///D:/mod/gui/sample.gui"].length, 2);
+  assert.equal(action.edit.changes["file:///D:/mod/gui/sample.gui"][0].newText, "raw_text");
+  assert.equal(action.edit.changes["file:///D:/mod/gui/sample.gui"][1].newText, "\"literal_text\"");
+});
+
+test("createMissingEventCodeAction creates an event stub", () => {
+  const tempRoot = fs.mkdtempSync(path.join(localTempRoot, "ck3-devkit-lsp-test-"));
+
+  try {
+    const eventFile = path.join(tempRoot, "sample_mod_events.txt");
+    const action = createMissingEventCodeAction(
+      {
+        range: {
+          start: { line: 1, character: 6 },
+          end: { line: 1, character: 21 },
+        },
+        message: "Unresolved event reference: sample_mod.9001",
+      },
+      "sample_mod.9001",
+      eventFile
+    );
+
+    assert.ok(action);
+    assert.match(action.title, /sample_mod\.9001/);
+    assert.ok(action.edit.documentChanges);
+    assert.equal(action.edit.documentChanges[0].kind, "create");
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("buildDocumentDiagnosticReport wraps diagnostics as full report", () => {

@@ -6,6 +6,26 @@
   "publisher": "local",
   "license": "UNLICENSED",
   "private": true,
+  "keywords": [
+    "crusader-kings-3",
+    "ck3",
+    "paradox",
+    "modding",
+    "language-server",
+    "vscode"
+  ],
+  "homepage": "https://github.com/adoringonion/ck3-dev-kit#readme",
+  "bugs": {
+    "url": "https://github.com/adoringonion/ck3-dev-kit/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:adoringonion/ck3-dev-kit.git"
+  },
+  "galleryBanner": {
+    "color": "#8b6b3f",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.86.0"
   },

@@ -34,16 +34,19 @@ import { pathToFileURL } from "url";
 import { createDocumentIndexRecord, WorkspaceIndex } from "../core/indexer";
 import { validateParsedDocumentAgainstIndex, validateReferences } from "../core/references";
 import { parseDocumentText } from "../core/document";
-import { ParsedDocument, AssignmentNode, ReferenceRecord, SymbolRecord } from "../core/types";
+import { LocalizationDocument, ParsedDocument, AssignmentNode, ReferenceRecord, SymbolRecord } from "../core/types";
 import { buildCachedWorkspaceIndex } from "../cli-shared";
 import { getScriptSyntaxHelp, SyntaxHelpContext } from "../extension/dynamicReferenceHelp";
 import { inferCompletionContext } from "../extension/completion";
 import {
   buildDocumentDiagnosticReport,
+  buildHoverMarkdown,
   buildInlayHints,
   buildRenameWorkspaceEdit,
   buildSemanticTokens,
   createAddUtf8BomCodeAction,
+  createConvertGuiTextToRawTextCodeAction,
+  createMissingEventCodeAction,
   createMissingScriptDefinitionCodeAction,
   completionDocumentation,
   createMissingLocalizationCodeAction,
@@ -157,7 +160,10 @@ connection.onHover(({ textDocument, position }): Hover | null => {
     };
   }
 
-  const target = symbolsByName(name).find((item) => item.kind !== "localization-reference");
+  const definitions = symbolsByName(name)
+    .filter((item) => item.kind !== "localization-reference")
+    .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
+  const target = definitions[0];
   if (!target) {
     return null;
   }
@@ -166,7 +172,14 @@ connection.onHover(({ textDocument, position }): Hover | null => {
   return {
     contents: {
       kind: MarkupKind.Markdown,
-      value: `**${target.name}**\n\nType: \`${target.kind}\`\n\nSource: \`${target.source}\`\n\nReferences: \`${referenceCount}\`\n\nPath: \`${target.path}\``,
+      value: buildHoverMarkdown(
+        target,
+        referenceCount,
+        definitions.length,
+        symbolSnippet(target),
+        localizationText(target),
+        localizationLanguage(target)
+      ),
     },
     range: wordRange,
   };
@@ -314,13 +327,46 @@ connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): 
 
 connection.onCodeAction((params): CodeAction[] => {
   const actions: CodeAction[] = [];
+  const document = documents.get(params.textDocument.uri);
   for (const diagnostic of params.context.diagnostics) {
     if (diagnostic.message === "Localization files should be saved as UTF-8 with BOM.") {
       actions.push(createAddUtf8BomCodeAction(diagnostic, params.textDocument.uri));
       continue;
     }
     const unresolvedLocalization = diagnostic.message.match(/^Unresolved localization reference: ([\w.:-]+)$/);
-    if (!unresolvedLocalization) {
+    if (unresolvedLocalization) {
+      const action = createMissingLocalizationCodeAction(
+        diagnostic,
+        unresolvedLocalization[1],
+        preferredLocalizationFile()
+      );
+      if (action) {
+        actions.push(action);
+      }
+
+      const rawTextAction = document
+        ? createGuiRawTextQuickFix(document, diagnostic, unresolvedLocalization[1])
+        : null;
+      if (rawTextAction) {
+        actions.push(rawTextAction);
+      }
+      continue;
+    }
+
+    const unresolvedEvent = diagnostic.message.match(/^Unresolved event reference: ([\w.:-]+)$/);
+    if (unresolvedEvent) {
+      const action = createMissingEventCodeAction(
+        diagnostic,
+        unresolvedEvent[1],
+        preferredEventFile(unresolvedEvent[1])
+      );
+      if (action) {
+        actions.push(action);
+      }
+      continue;
+    }
+
+    {
       const unresolvedScriptDefinition = diagnostic.message.match(/^Unresolved (scripted_effect|scripted_trigger|script_value) reference: ([\w.:-]+)$/);
       if (!unresolvedScriptDefinition) {
         continue;
@@ -335,14 +381,6 @@ connection.onCodeAction((params): CodeAction[] => {
         actions.push(action);
       }
       continue;
-    }
-    const action = createMissingLocalizationCodeAction(
-      diagnostic,
-      unresolvedLocalization[1],
-      preferredLocalizationFile()
-    );
-    if (action) {
-      actions.push(action);
     }
   }
   return actions;
@@ -704,6 +742,27 @@ function preferredScriptDefinitionFile(kind: "scripted_effect" | "scripted_trigg
   return null;
 }
 
+function preferredEventFile(eventId: string): string | null {
+  const namespace = eventId.includes(".") ? eventId.split(".")[0] : "generated";
+  for (const root of config.modRoots) {
+    const folder = path.join(root, "events");
+    if (!fsExists(folder)) {
+      const parent = path.dirname(folder);
+      if (!fsExists(parent)) {
+        continue;
+      }
+      return path.join(folder, `${namespace}_events.txt`);
+    }
+    const files = walkFiles(folder).filter((file) => file.toLowerCase().endsWith(".txt"));
+    const namespaceMatch = files.find((file) => path.basename(file).toLowerCase().includes(namespace.toLowerCase()));
+    if (namespaceMatch) {
+      return namespaceMatch;
+    }
+    return path.join(folder, `${namespace}_events.txt`);
+  }
+  return null;
+}
+
 function walkFiles(root: string): string[] {
   const results: string[] = [];
   const queue = [root];
@@ -806,6 +865,49 @@ function toReferenceLocation(reference: ReferenceRecord): Location {
   };
 }
 
+function symbolSnippet(symbol: SymbolRecord): string | undefined {
+  const text = liveDocuments.get(pathToFileURL(symbol.path).toString())?.parsed.text
+    ?? index.documents.get(symbol.path)?.text;
+  if (!text) {
+    return undefined;
+  }
+
+  const lines = text.split(/\r?\n/);
+  const startLine = Math.max(symbol.range.start.line - 1, 0);
+  const endLine = Math.min(symbol.range.end.line + 1, lines.length - 1);
+  return lines.slice(startLine, endLine + 1).join("\n").trim();
+}
+
+function localizationText(symbol: SymbolRecord): string | undefined {
+  if (symbol.kind !== "localization") {
+    return undefined;
+  }
+  const parsed = parsedDocumentForSymbol(symbol);
+  if (!parsed || parsed.kind !== "localization") {
+    return undefined;
+  }
+  return parsed.entries.find((entry) => entry.key === symbol.name)?.value;
+}
+
+function localizationLanguage(symbol: SymbolRecord): string | null | undefined {
+  if (symbol.kind !== "localization") {
+    return undefined;
+  }
+  const parsed = parsedDocumentForSymbol(symbol);
+  if (!parsed || parsed.kind !== "localization") {
+    return undefined;
+  }
+  return parsed.language;
+}
+
+function parsedDocumentForSymbol(symbol: SymbolRecord): ParsedDocument | undefined {
+  const live = liveDocuments.get(pathToFileURL(symbol.path).toString())?.parsed;
+  if (live) {
+    return live;
+  }
+  return index.documents.get(symbol.path);
+}
+
 function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: string[]): boolean {
   return completionKinds.some((kind) => {
     if (kind === "character_modifier" || kind === "county_modifier" || kind === "province_modifier" || kind === "artifact_modifier") {
@@ -860,4 +962,29 @@ function safeReadDir(filePath: string): string[] {
   } catch {
     return [];
   }
+}
+
+function createGuiRawTextQuickFix(document: TextDocument, diagnostic: Diagnostic, symbolName: string): CodeAction | null {
+  const line = document.getText({
+    start: { line: diagnostic.range.start.line, character: 0 },
+    end: { line: diagnostic.range.start.line + 1, character: 0 },
+  }).replace(/\r?\n$/, "");
+  const match = line.match(/^(\s*)text(\s*=\s*)([\w.:-]+)\s*$/);
+  if (!match || match[3] !== symbolName) {
+    return null;
+  }
+  const keyStart = match[1].length;
+  const keyEnd = keyStart + "text".length;
+  const valueStart = keyEnd + match[2].length;
+  const valueEnd = valueStart + symbolName.length;
+  return createConvertGuiTextToRawTextCodeAction(
+    diagnostic,
+    document.uri,
+    symbolName,
+    diagnostic.range.start.line,
+    keyStart,
+    keyEnd,
+    valueStart,
+    valueEnd
+  );
 }
