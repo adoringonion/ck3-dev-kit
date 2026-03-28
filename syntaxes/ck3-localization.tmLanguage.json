@@ -1,0 +1,71 @@
+{
+  "scopeName": "text.ck3.localization",
+  "name": "CK3 Localization",
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "^\\s*#.*$",
+          "name": "comment.line.number-sign.ck3loc"
+        }
+      ]
+    },
+    "header": {
+      "patterns": [
+        {
+          "match": "^\\s*l_[a-z_]+:",
+          "name": "keyword.other.language-header.ck3loc"
+        }
+      ]
+    },
+    "keys": {
+      "patterns": [
+        {
+          "match": "^\\s*[\\w.:-]+(?=\\s*:)",
+          "name": "entity.name.tag.ck3loc"
+        },
+        {
+          "match": "(?<=^[\\s\\w.:-]+:)\\d+",
+          "name": "constant.numeric.version.ck3loc"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "match": "\"(?:\\\\.|[^\"])*\"",
+          "name": "string.quoted.double.ck3loc"
+        }
+      ]
+    },
+    "markers": {
+      "patterns": [
+        {
+          "match": "\\$[\\w.:-]+\\$",
+          "name": "variable.other.localization-substitution.ck3loc"
+        },
+        {
+          "match": "\\[[^\\]\\n]+\\]",
+          "name": "support.function.inline-script.ck3loc"
+        }
+      ]
+    }
+  },
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#header"
+    },
+    {
+      "include": "#keys"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#markers"
+    }
+  ]
+}

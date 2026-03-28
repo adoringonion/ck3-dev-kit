@@ -1,0 +1,131 @@
+{
+  "scopeName": "source.ck3",
+  "name": "CK3 Script",
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "#.*$",
+          "name": "comment.line.number-sign.ck3"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "match": "\"(?:\\\\.|[^\"])*\"",
+          "name": "string.quoted.double.ck3"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "match": "(?<![<>!])=(?![=])|<=|>=|!=|<|>",
+          "name": "keyword.operator.comparison.ck3"
+        }
+      ]
+    },
+    "booleans": {
+      "patterns": [
+        {
+          "match": "\\b(yes|no)\\b",
+          "name": "constant.language.boolean.ck3"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "match": "\\b-?\\d+(?:\\.\\d+)?\\b",
+          "name": "constant.numeric.ck3"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(namespace|type|title|desc|name|trigger|effect|option|if|else|else_if|limit|modifier|trigger_event|triggered_event|immediate|after|hidden_effect|custom_tooltip|weight_multiplier|ai_chance|random_list|random|every|any|ordered|first_valid|switch|case|value|add|subtract|multiply|divide|set_variable|change_variable|set_global_variable|change_global_variable)\\b",
+          "name": "keyword.control.ck3"
+        }
+      ]
+    },
+    "definitions": {
+      "patterns": [
+        {
+          "match": "\\bnamespace\\b\\s*=\\s*[A-Za-z_][\\w.-]*",
+          "captures": {
+            "0": {
+              "name": "meta.definition.namespace.ck3"
+            }
+          }
+        },
+        {
+          "match": "\\b[A-Za-z_][\\w-]*\\.\\d+\\b(?=\\s*=)",
+          "name": "entity.name.function.event.ck3"
+        },
+        {
+          "match": "\\b[a-zA-Z_][\\w:.-]*\\b(?=\\s*=)",
+          "name": "entity.name.tag.ck3"
+        }
+      ]
+    },
+    "references": {
+      "patterns": [
+        {
+          "match": "\\b(scope|root|prev|this|owner|holder|liege|culture|faith|title):[A-Za-z_][\\w.-]*\\b",
+          "name": "variable.parameter.scope.ck3"
+        },
+        {
+          "match": "\\b(doctrine|culture_tradition|culture_pillar|faith|artifact):[A-Za-z_][\\w.-]*\\b",
+          "name": "constant.other.prefixed-reference.ck3"
+        },
+        {
+          "match": "\\b[A-Za-z_][\\w-]*\\.\\d+(?:\\.[A-Za-z_][\\w-]*)?\\b",
+          "name": "support.constant.event-reference.ck3"
+        },
+        {
+          "match": "\\b[A-Za-z_][\\w-]*\\.[A-Za-z0-9_.-]+\\b",
+          "name": "support.constant.localization-reference.ck3"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "match": "[{}\\[\\]()]",
+          "name": "punctuation.section.block.ck3"
+        }
+      ]
+    }
+  },
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#booleans"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#definitions"
+    },
+    {
+      "include": "#references"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ]
+}

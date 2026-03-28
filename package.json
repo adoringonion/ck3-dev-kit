@@ -1,0 +1,137 @@
+{
+  "name": "ck3-devkit",
+  "displayName": "CK3 Mod DevKit",
+  "description": "Parser-backed VSCode tooling for Crusader Kings III mod development.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onLanguage:ck3-script",
+    "onLanguage:ck3-localization",
+    "onCommand:ck3ModDevkit.associateWorkspace",
+    "onCommand:ck3ModDevkit.rebuildIndex",
+    "onCommand:ck3ModDevkit.analyzeErrorLog"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ck3ModDevkit.associateWorkspace",
+        "title": "CK3 Mod DevKit: Write Workspace File Associations"
+      },
+      {
+        "command": "ck3ModDevkit.rebuildIndex",
+        "title": "CK3 Mod DevKit: Rebuild Symbol Index"
+      },
+      {
+        "command": "ck3ModDevkit.analyzeErrorLog",
+        "title": "CK3 Mod DevKit: Analyze CK3 Error Log"
+      }
+    ],
+    "configuration": {
+      "title": "CK3 Mod DevKit",
+      "properties": {
+        "ck3ModDevkit.modRoots": {
+          "type": "array",
+          "default": [
+            "${workspaceFolder}"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Folders that contain your active mod files."
+        },
+        "ck3ModDevkit.referenceRoots": {
+          "type": "array",
+          "default": [
+            "${workspaceFolder}/../../game"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Read-only CK3 vanilla folders used to resolve definitions."
+        },
+        "ck3ModDevkit.maxFiles": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 100,
+          "description": "Soft cap for indexed files."
+        },
+        "ck3ModDevkit.errorLogPath": {
+          "type": "string",
+          "default": "${userHome}/Documents/Paradox Interactive/Crusader Kings III/logs/error.log",
+          "description": "Path to the CK3 error.log file used by the Analyze CK3 Error Log command."
+        }
+      }
+    },
+    "languages": [
+      {
+        "id": "ck3-script",
+        "aliases": [
+          "CK3 Script"
+        ],
+        "extensions": [
+          ".txt",
+          ".gui",
+          ".info",
+          ".asset"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "ck3-localization",
+        "aliases": [
+          "CK3 Localization"
+        ],
+        "extensions": [
+          ".yml"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ck3-script",
+        "scopeName": "source.ck3",
+        "path": "./syntaxes/ck3-script.tmLanguage.json"
+      },
+      {
+        "language": "ck3-localization",
+        "scopeName": "text.ck3.localization",
+        "path": "./syntaxes/ck3-localization.tmLanguage.json"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node ./node_modules/typescript/bin/tsc -p .",
+    "watch": "node ./node_modules/typescript/bin/tsc -w -p .",
+    "check": "node ./node_modules/typescript/bin/tsc -p . --noEmit",
+    "test": "npm run build && node --test test/core.test.js && node --test test/cli.test.js",
+    "package:vsix": "npm run build && node ./node_modules/@vscode/vsce/vsce package --no-dependencies",
+    "index": "node dist/cli.js",
+    "find-symbol": "node dist/find-symbol.js",
+    "find-references": "node dist/find-references.js",
+    "cache-info": "node dist/cache-info.js",
+    "rebuild-cache": "node dist/rebuild-cache.js",
+    "analyze-error-log": "node dist/analyze-error-log.js",
+    "parse-file": "node dist/parse-file.js",
+    "diagnostics": "node dist/diagnostics.js",
+    "validate-references": "node dist/validate-references.js",
+    "generate-skill": "node dist/generate-skill.js"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.24",
+    "@types/vscode": "^1.86.0",
+    "@vscode/vsce": "^2.15.0",
+    "typescript": "^5.4.5"
+  }
+}
