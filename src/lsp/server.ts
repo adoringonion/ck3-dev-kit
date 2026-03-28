@@ -65,7 +65,7 @@ import {
   IndexStatusPayload,
   REBUILD_INDEX_NOTIFICATION,
 } from "./protocol";
-import { ServerConfig, ServerState, SourceKind } from "./serverState";
+import { ServerConfig, ServerSnapshot, ServerState, SourceKind } from "./serverState";
 
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
@@ -113,12 +113,13 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
   if (!document) {
     return null;
   }
+  const snapshot = state.snapshot();
 
   if (indexBuildPromise) {
     return indexingHover("CK3 Mod DevKit is building the symbol index. Hover, definition, and references will fill in when indexing completes.");
   }
-  if (!state.isIndexReady() && state.getLastIndexError()) {
-    return indexingHover(`CK3 Mod DevKit failed to build its symbol index.\n\n${state.getLastIndexError()}`);
+  if (!snapshot.isIndexReady() && snapshot.getLastIndexError()) {
+    return indexingHover(`CK3 Mod DevKit failed to build its symbol index.\n\n${snapshot.getLastIndexError()}`);
   }
 
   const wordRange = findWordRange(document, position);
@@ -126,12 +127,12 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
     return null;
   }
   const cacheKey = state.hoverCacheKey(document, wordRange);
-  const cached = state.getHoverCache(cacheKey);
+  const cached = snapshot.getHoverCache(cacheKey);
   if (cached !== undefined) {
     return cached;
   }
 
-  const parsed = parsedDocumentForUri(document.uri)
+  const parsed = snapshot.parsedDocumentForUri(document.uri)
     ?? parseDocumentText(uriToFsPath(document.uri), document.getText());
   const name = document.getText(wordRange);
   const syntaxHelp = getScriptSyntaxHelp(name, parsed.kind === "script" ? syntaxHelpContextAt(parsed, wordRange) : undefined);
@@ -143,18 +144,18 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
       },
       range: wordRange,
     };
-    state.setHoverCache(cacheKey, hover);
+    snapshot.setHoverCache(cacheKey, hover);
     return hover;
   }
 
-  const definitions = state.definitionSymbols(name);
+  const definitions = snapshot.definitionSymbols(name);
   const target = definitions[0];
   if (!target) {
-    state.setHoverCache(cacheKey, null);
+    snapshot.setHoverCache(cacheKey, null);
     return null;
   }
 
-  const referenceCount = referencesByName(name).length;
+  const referenceCount = snapshot.referencesByName(name).length;
   const hover = {
     contents: {
       kind: MarkupKind.Markdown,
@@ -162,20 +163,21 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
         target,
         referenceCount,
         definitions.length,
-        state.symbolSnippet(target),
-        state.localizationText(target),
-        state.localizationLanguage(target)
+        snapshot.symbolSnippet(target),
+        snapshot.localizationText(target),
+        snapshot.localizationLanguage(target)
       ),
     },
     range: wordRange,
   };
-  state.setHoverCache(cacheKey, hover);
+  snapshot.setHoverCache(cacheKey, hover);
   return hover;
 }));
 
 connection.onDefinition(({ textDocument, position }): Definition | null => timeRequest("definition", () => {
   const document = documents.get(textDocument.uri);
-  if (!document || indexBuildPromise || !state.isIndexReady()) {
+  const snapshot = state.snapshot();
+  if (!document || indexBuildPromise || !snapshot.isIndexReady()) {
     return null;
   }
   const wordRange = findWordRange(document, position);
@@ -184,7 +186,7 @@ connection.onDefinition(({ textDocument, position }): Definition | null => timeR
   }
 
   const name = document.getText(wordRange);
-  const relevant = state.definitionSymbols(name);
+  const relevant = snapshot.definitionSymbols(name);
   if (relevant.length === 0) {
     return null;
   }
@@ -193,7 +195,8 @@ connection.onDefinition(({ textDocument, position }): Definition | null => timeR
 
 connection.onReferences(({ textDocument, position }: ReferenceParams): Location[] | null => timeRequest("references", () => {
   const document = documents.get(textDocument.uri);
-  if (!document || indexBuildPromise || !state.isIndexReady()) {
+  const snapshot = state.snapshot();
+  if (!document || indexBuildPromise || !snapshot.isIndexReady()) {
     return null;
   }
   const wordRange = findWordRange(document, position);
@@ -201,7 +204,7 @@ connection.onReferences(({ textDocument, position }: ReferenceParams): Location[
     return null;
   }
   const name = document.getText(wordRange);
-  return referencesByName(name).map(toReferenceLocation);
+  return snapshot.referencesByName(name).map(toReferenceLocation);
 }));
 
 connection.onCompletion(({ textDocument, position }: CompletionParams): CompletionItem[] | null => timeRequest("completion", () => {
@@ -209,6 +212,7 @@ connection.onCompletion(({ textDocument, position }: CompletionParams): Completi
   if (!document) {
     return null;
   }
+  const snapshot = state.snapshot();
 
   const lines = document.getText().split(/\r?\n/);
   const currentLine = lines[position.line] ?? "";
@@ -218,7 +222,7 @@ connection.onCompletion(({ textDocument, position }: CompletionParams): Completi
     return null;
   }
 
-  const symbols = completionSymbols(context.kinds, context.query);
+  const symbols = snapshot.completionSymbols(context.kinds, context.query);
   return symbols.map((symbol) => ({
     label: context.prefix ? `${context.prefix}${symbol.name}` : symbol.name,
     kind: toCompletionItemKind(symbol.kind),
@@ -262,7 +266,7 @@ connection.onDocumentSymbol(({ textDocument }) => {
 });
 
 connection.onWorkspaceSymbol(({ query }: WorkspaceSymbolParams): SymbolInformation[] => {
-  return state.workspaceSymbols(query)
+  return state.snapshot().workspaceSymbols(query)
     .map((symbol) => toWorkspaceSymbol(symbol) as SymbolInformation);
 });
 
@@ -276,8 +280,9 @@ connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams) => 
     return null;
   }
   const name = document.getText(wordRange);
-  const candidate = targetRenameCandidate(document.uri, wordRange, name);
-  const target = resolveModRenameTarget(candidate, symbolsByName(name));
+  const snapshot = state.snapshot();
+  const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name);
+  const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name));
   if (!target) {
     return null;
   }
@@ -297,13 +302,14 @@ connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): 
     return null;
   }
   const name = document.getText(wordRange);
-  const candidate = targetRenameCandidate(document.uri, wordRange, name);
-  const target = resolveModRenameTarget(candidate, symbolsByName(name));
+  const snapshot = state.snapshot();
+  const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name);
+  const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name));
   if (!target) {
     return null;
   }
-  const symbols = filterModRenameSymbols(symbolsByName(name), target);
-  const references = filterModRenameReferences(referencesByName(name), target);
+  const symbols = filterModRenameSymbols(snapshot.symbolsByName(name), target);
+  const references = filterModRenameReferences(snapshot.referencesByName(name), target);
   if (symbols.length === 0 && references.length === 0) {
     return null;
   }
@@ -377,7 +383,7 @@ connection.languages.inlayHint.on(({ textDocument }): InlayHint[] => {
     return [];
   }
   const parsed = parseDocumentText(uriToFsPath(document.uri), document.getText());
-  return buildInlayHints(parsed, uriToFsPath(document.uri), allSymbols());
+  return buildInlayHints(parsed, uriToFsPath(document.uri), state.snapshot().allSymbols());
 });
 
 connection.languages.semanticTokens.on(({ textDocument }): SemanticTokens => {
@@ -512,24 +518,8 @@ function scheduleWorkspaceDiagnostics(): void {
     });
 }
 
-function symbolsByName(name: string): SymbolRecord[] {
-  return state.symbolsByName(name);
-}
-
-function referencesByName(name: string): ReferenceRecord[] {
-  return state.referencesByName(name);
-}
-
-function allSymbols(query?: string): SymbolRecord[] {
-  return state.allSymbols(query);
-}
-
-function completionSymbols(kinds: string[], query = "", limit = 100): SymbolRecord[] {
-  return state.completionSymbols(kinds, query, limit);
-}
-
-function targetRenameCandidate(documentUri: string, range: Range, name: string): { kind: string; source: SourceKind } | null {
-  const candidate = state.renameCandidate(documentUri, range.start, name);
+function targetRenameCandidate(snapshot: ServerSnapshot, documentUri: string, range: Range, name: string): { kind: string; source: SourceKind } | null {
+  const candidate = snapshot.renameCandidate(documentUri, range.start, name);
   if (!candidate) {
     return null;
   }
@@ -628,10 +618,6 @@ function indexingHover(message: string): Hover {
       value: message,
     },
   };
-}
-
-function parsedDocumentForUri(uri: string): ParsedDocument | undefined {
-  return state.getParsedDocumentForUri(uri);
 }
 
 function sendIndexStatus(payload: IndexStatusPayload): void {

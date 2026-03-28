@@ -98,6 +98,10 @@ export class ServerState {
     return this.lastIndexError;
   }
 
+  snapshot(): ServerSnapshot {
+    return new ServerSnapshot(this);
+  }
+
   setLiveDocument(document: TextDocument, source: SourceKind): LiveDocumentRecord {
     const filePath = uriToFsPath(document.uri);
     const record = {
@@ -617,5 +621,69 @@ function fsExists(filePath: string): boolean {
     return require("fs").existsSync(filePath);
   } catch {
     return false;
+  }
+}
+
+export class ServerSnapshot {
+  constructor(private readonly state: ServerState) {}
+
+  isIndexReady(): boolean {
+    return this.state.isIndexReady();
+  }
+
+  getLastIndexError(): string | null {
+    return this.state.getLastIndexError();
+  }
+
+  getHoverCache(key: string): Hover | null | undefined {
+    return this.state.getHoverCache(key);
+  }
+
+  setHoverCache(key: string, hover: Hover | null): void {
+    this.state.setHoverCache(key, hover);
+  }
+
+  parsedDocumentForUri(uri: string): ParsedDocument | undefined {
+    return this.state.getParsedDocumentForUri(uri);
+  }
+
+  symbolsByName(name: string): SymbolRecord[] {
+    return this.state.symbolsByName(name);
+  }
+
+  referencesByName(name: string): ReferenceRecord[] {
+    return this.state.referencesByName(name);
+  }
+
+  definitionSymbols(name: string): SymbolRecord[] {
+    return this.state.definitionSymbols(name);
+  }
+
+  workspaceSymbols(query?: string): SymbolRecord[] {
+    return this.state.workspaceSymbols(query);
+  }
+
+  allSymbols(query?: string): SymbolRecord[] {
+    return this.state.allSymbols(query);
+  }
+
+  completionSymbols(kinds: string[], query = "", limit = 100): SymbolRecord[] {
+    return this.state.completionSymbols(kinds, query, limit);
+  }
+
+  renameCandidate(documentUri: string, position: { line: number; character: number }, name: string): RenameCandidate | null {
+    return this.state.renameCandidate(documentUri, position, name);
+  }
+
+  symbolSnippet(symbol: SymbolRecord): string | undefined {
+    return this.state.symbolSnippet(symbol);
+  }
+
+  localizationText(symbol: SymbolRecord): string | undefined {
+    return this.state.localizationText(symbol);
+  }
+
+  localizationLanguage(symbol: SymbolRecord): string | null | undefined {
+    return this.state.localizationLanguage(symbol);
   }
 }
