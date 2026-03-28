@@ -1,9 +1,6 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
 import { LanguageClient } from "vscode-languageclient/node";
-import { BackendManager } from "./extension/backendManager";
-import { IndexStore } from "./extension/indexStore";
-import { registerProviders } from "./extension/providers";
 import { writeWorkspaceAssociations } from "./extension/workspaceSettings";
 import { readConfig } from "./extension/config";
 import { createLanguageClient } from "./lsp/client";
@@ -12,76 +9,60 @@ import {
   AnalyzeErrorLogResponse,
   INDEX_STATUS_NOTIFICATION,
   IndexStatusPayload,
+  REBUILD_INDEX_NOTIFICATION,
 } from "./lsp/protocol";
 
-let activeBackendManager: BackendManager<LanguageClient> | undefined;
+let activeLanguageClient: LanguageClient | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel("CK3 Mod DevKit");
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.name = "CK3 Mod DevKit";
-  context.subscriptions.push(output);
-  context.subscriptions.push(statusBar);
+  context.subscriptions.push(output, statusBar);
+
   let indexBusy = false;
-  let fallbackStore: IndexStore | undefined;
+  let client = createLanguageClient(context, readConfig(), output);
+  activeLanguageClient = client;
 
-  const backendManager = new BackendManager<LanguageClient>({
-    createLanguageClient: async () => {
-      const nextClient = createLanguageClient(context, readConfig(), output);
-      nextClient.onNotification(INDEX_STATUS_NOTIFICATION, (payload: IndexStatusPayload) => {
-        const timestamp = `[${new Date().toISOString()}]`;
-        if (payload.phase === "started") {
-          indexBusy = true;
-          statusBar.text = "$(sync~spin) CK3 Indexing";
-          statusBar.tooltip = `CK3 Mod DevKit is building the symbol index (${payload.reason}).`;
-          statusBar.show();
-          output.appendLine(`${timestamp} Index build started: ${payload.reason}`);
-          return;
-        }
-        if (payload.phase === "busy") {
-          indexBusy = true;
-          statusBar.text = "$(sync~spin) CK3 Indexing";
-          statusBar.tooltip = "CK3 Mod DevKit is already building the symbol index.";
-          statusBar.show();
-          output.appendLine(`${timestamp} Index build already in progress: ${payload.reason}`);
-          return;
-        }
-        if (payload.phase === "completed") {
-          indexBusy = false;
-          statusBar.hide();
-          output.appendLine(`${timestamp} Index build completed: ${payload.reason}`);
-          if (payload.reason === "startup") {
-            void vscode.window.setStatusBarMessage("CK3 symbol index ready.", 3000);
-          }
-          return;
-        }
-
-        indexBusy = false;
-        statusBar.text = "$(error) CK3 Index Failed";
-        statusBar.tooltip = payload.message ?? "CK3 Mod DevKit failed to build the symbol index.";
+  const bindClientNotifications = (languageClient: LanguageClient) => {
+    languageClient.onNotification(INDEX_STATUS_NOTIFICATION, (payload: IndexStatusPayload) => {
+      const timestamp = `[${new Date().toISOString()}]`;
+      if (payload.phase === "started" || payload.phase === "busy") {
+        indexBusy = true;
+        statusBar.text = "$(sync~spin) CK3 Indexing";
+        statusBar.tooltip = payload.phase === "started"
+          ? `CK3 Mod DevKit is building the symbol index (${payload.reason}).`
+          : "CK3 Mod DevKit is already building the symbol index.";
         statusBar.show();
-        output.appendLine(`${timestamp} Index build failed: ${payload.reason}`);
-        if (payload.message) {
-          output.appendLine(payload.message);
+        output.appendLine(`${timestamp} Index build ${payload.phase === "started" ? "started" : "already in progress"}: ${payload.reason}`);
+        return;
+      }
+      if (payload.phase === "completed") {
+        indexBusy = false;
+        statusBar.hide();
+        output.appendLine(`${timestamp} Index build completed: ${payload.reason}`);
+        if (payload.reason === "startup") {
+          void vscode.window.setStatusBarMessage("CK3 symbol index ready.", 3000);
         }
-        void vscode.window.showErrorMessage("CK3 Mod DevKit failed to build its index. Check the 'CK3 Mod DevKit' output channel.");
-      });
-      context.subscriptions.push(nextClient);
-      output.appendLine(`[${new Date().toISOString()}] Starting language server.`);
-      await nextClient.start();
-      output.appendLine(`[${new Date().toISOString()}] Language server started.`);
-      return nextClient;
-    },
-    registerFallbackProviders: () => {
-      fallbackStore ??= new IndexStore();
-      return registerProviders(context, fallbackStore);
-    },
-    rebuildFallbackIndex: async () => {
-      fallbackStore ??= new IndexStore();
-      await fallbackStore.rebuild();
-    },
-  });
-  activeBackendManager = backendManager;
+        return;
+      }
+
+      indexBusy = false;
+      statusBar.text = "$(error) CK3 Index Failed";
+      statusBar.tooltip = payload.message ?? "CK3 Mod DevKit failed to build the symbol index.";
+      statusBar.show();
+      output.appendLine(`${timestamp} Index build failed: ${payload.reason}`);
+      if (payload.message) {
+        output.appendLine(payload.message);
+      }
+      void vscode.window.showErrorMessage("CK3 Mod DevKit failed to build its index. Check the 'CK3 Mod DevKit' output channel.");
+    });
+  };
+
+  bindClientNotifications(client);
+  output.appendLine(`[${new Date().toISOString()}] Starting language server.`);
+  await client.start();
+  output.appendLine(`[${new Date().toISOString()}] Language server started.`);
 
   const rebuildIndex = async (reason: string, notify = false) => {
     if (indexBusy) {
@@ -93,35 +74,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     try {
       output.appendLine(`[${new Date().toISOString()}] Rebuilding index: ${reason}`);
-      const activeBackend = await backendManager.rebuild();
-      if (activeBackend === "fallback") {
-        output.appendLine(`[${new Date().toISOString()}] Fallback index rebuilt.`);
-      } else if (activeBackend === "none") {
-        output.appendLine(`[${new Date().toISOString()}] No active language backend to rebuild.`);
-      }
-      output.appendLine(`[${new Date().toISOString()}] Index rebuild complete.`);
+      await client.sendNotification(REBUILD_INDEX_NOTIFICATION);
+      output.appendLine(`[${new Date().toISOString()}] Index rebuild requested.`);
       if (notify) {
-        vscode.window.showInformationMessage("CK3 symbol index rebuilt.");
+        void vscode.window.showInformationMessage("CK3 symbol index rebuild requested.");
       }
     } catch (error) {
       const message = error instanceof Error ? error.stack ?? error.message : String(error);
       output.appendLine(`[${new Date().toISOString()}] Index rebuild failed.`);
       output.appendLine(message);
-      void vscode.window.showErrorMessage("CK3 Mod DevKit failed to build its index. Check the 'CK3 Mod DevKit' output channel.");
+      void vscode.window.showErrorMessage("CK3 Mod DevKit failed to rebuild its index. Check the 'CK3 Mod DevKit' output channel.");
     }
   };
 
   void promptForWorkspaceAssociations();
-  try {
-    await backendManager.start();
-  } catch (error) {
-    const message = error instanceof Error ? error.stack ?? error.message : String(error);
-    output.appendLine(`[${new Date().toISOString()}] Language server failed to start. Falling back to direct providers.`);
-    output.appendLine(message);
-    backendManager.enableFallback();
-    void vscode.window.showWarningMessage("CK3 Mod DevKit language server failed to start. Using fallback providers.");
-    void rebuildIndex("fallback activation");
-  }
 
   context.subscriptions.push(
     vscode.commands.registerCommand("ck3ModDevkit.associateWorkspace", async () => {
@@ -137,11 +103,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
-      const client = backendManager.getLanguageClient();
-      if (!client) {
-        void vscode.window.showWarningMessage("CK3 Mod DevKit language server is not running. error.log analysis is unavailable in fallback mode.");
-        return;
-      }
       const analysis = await client.sendRequest<AnalyzeErrorLogResponse>(ANALYZE_ERROR_LOG_REQUEST, {
         logPath: config.errorLogPath,
       });
@@ -169,26 +130,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
     }),
     vscode.workspace.onDidChangeConfiguration(async (event) => {
-      if (event.affectsConfiguration("ck3ModDevkit")) {
-        try {
-          await backendManager.restart();
-        } catch (error) {
-          const message = error instanceof Error ? error.stack ?? error.message : String(error);
-          output.appendLine(`[${new Date().toISOString()}] Language server restart failed.`);
-          output.appendLine(message);
-          backendManager.enableFallback();
-        }
-        if (backendManager.isUsingFallback()) {
-          await rebuildIndex("configuration change");
-        }
+      if (!event.affectsConfiguration("ck3ModDevkit")) {
+        return;
       }
+      output.appendLine(`[${new Date().toISOString()}] Restarting language server after configuration change.`);
+      await client.stop();
+      client = createLanguageClient(context, readConfig(), output);
+      activeLanguageClient = client;
+      bindClientNotifications(client);
+      await client.start();
     })
   );
 }
 
 export async function deactivate(): Promise<void> {
-  await activeBackendManager?.deactivate();
-  activeBackendManager = undefined;
+  if (!activeLanguageClient) {
+    return;
+  }
+  const client = activeLanguageClient;
+  activeLanguageClient = undefined;
+  await client.stop();
 }
 
 async function promptForWorkspaceAssociations(): Promise<void> {

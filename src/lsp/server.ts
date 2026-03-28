@@ -5,7 +5,6 @@ import {
   createConnection,
   Definition,
   Diagnostic,
-  DiagnosticSeverity,
   Hover,
   InitializeParams,
   InitializeResult,
@@ -28,11 +27,10 @@ import { TextDocument } from "vscode-languageserver-textdocument";
 import * as path from "path";
 import { pathToFileURL } from "url";
 import { Worker } from "worker_threads";
-import { createDocumentIndexRecord, WorkspaceIndex } from "../core/indexer";
+import { WorkspaceIndex } from "../core/indexer";
 import { analyzeErrorLogFile } from "../core/errorLog";
-import { collectParsedReferences, validateParsedReferencesAgainstIndex } from "../core/references";
 import { parseDocumentText } from "../core/document";
-import { LocalizationDocument, ParsedDocument, AssignmentNode, ReferenceRecord, SymbolRecord } from "../core/types";
+import { ParsedDocument, AssignmentNode, ReferenceRecord, SymbolRecord } from "../core/types";
 import { getScriptSyntaxHelp, SyntaxHelpContext } from "../extension/dynamicReferenceHelp";
 import { inferCompletionContext } from "../extension/completion";
 import {
@@ -71,9 +69,7 @@ import { ServerConfig, ServerState, SourceKind } from "./serverState";
 
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
-const state = new ServerState<Diagnostic>();
-const diagnosticTimers = new Map<string, NodeJS.Timeout>();
-let workspaceDiagnosticRun = 0;
+const state = new ServerState();
 let indexBuildPromise: Promise<void> | null = null;
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
@@ -108,7 +104,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 connection.onInitialized(() => {
   void rebuildIndex("startup");
   for (const document of documents.all()) {
-    syncDocument(document);
+    state.syncDocument(document);
   }
 });
 
@@ -413,18 +409,18 @@ connection.onRequest(ANALYZE_ERROR_LOG_REQUEST, (params: AnalyzeErrorLogParams |
 });
 
 documents.onDidOpen((event) => {
-  syncDocument(event.document);
+  state.syncDocument(event.document);
   scheduleDiagnostics(event.document, 2000);
 });
 
 documents.onDidChangeContent((event) => {
-  syncDocument(event.document);
+  state.syncDocument(event.document);
   clearHoverCacheForUri(event.document.uri);
   scheduleDiagnostics(event.document, 750);
 });
 
 documents.onDidClose((event) => {
-  clearDiagnosticTimer(event.document.uri);
+  state.cancelDocumentDiagnostics(event.document.uri);
   clearHoverCacheForUri(event.document.uri);
   state.deleteLiveDocument(event.document.uri);
   connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
@@ -471,7 +467,7 @@ async function rebuildIndex(reason: string): Promise<void> {
     }
 
     for (const document of documents.all()) {
-      syncDocument(document);
+      state.syncDocument(document);
       scheduleDiagnostics(document, 750);
     }
     scheduleWorkspaceDiagnostics();
@@ -480,22 +476,8 @@ async function rebuildIndex(reason: string): Promise<void> {
   await indexBuildPromise;
 }
 
-function syncDocument(document: TextDocument): void {
-  const filePath = uriToFsPath(document.uri);
-  if (!matchesCk3Path(filePath)) {
-    state.deleteLiveDocument(document.uri);
-    return;
-  }
-  const source = state.resolveSource(filePath);
-  state.setLiveDocument(document, source);
-}
-
 function publishDiagnostics(document: TextDocument): void {
-  const cached = state.getDiagnosticCache(document.uri);
-  const diagnostics = cached && cached.version === document.version && cached.indexRevision === state.getIndexRevision()
-    ? cached.diagnostics
-    : timeRequest("publishDiagnostics", () => collectDocumentDiagnostics(document));
-  state.setDiagnosticCache(document.uri, document.version, diagnostics);
+  const diagnostics = timeRequest("publishDiagnostics", () => state.collectDocumentDiagnostics(document));
   connection.sendDiagnostics({
     uri: document.uri,
     diagnostics,
@@ -503,21 +485,9 @@ function publishDiagnostics(document: TextDocument): void {
 }
 
 function scheduleDiagnostics(document: TextDocument, delayMs: number): void {
-  clearDiagnosticTimer(document.uri);
-  const timer = setTimeout(() => {
-    diagnosticTimers.delete(document.uri);
+  state.scheduleDocumentDiagnostics(document.uri, delayMs, () => {
     publishDiagnostics(document);
-  }, delayMs);
-  diagnosticTimers.set(document.uri, timer);
-}
-
-function clearDiagnosticTimer(uri: string): void {
-  const timer = diagnosticTimers.get(uri);
-  if (!timer) {
-    return;
-  }
-  clearTimeout(timer);
-  diagnosticTimers.delete(uri);
+  });
 }
 
 function clearHoverCacheForUri(uri: string): void {
@@ -525,92 +495,21 @@ function clearHoverCacheForUri(uri: string): void {
 }
 
 function scheduleWorkspaceDiagnostics(): void {
-  const runId = ++workspaceDiagnosticRun;
   const entries = Array.from(state.getIndex().documents.entries())
-    .filter(([filePath]) => state.resolveSource(filePath) === "mod");
-  let cursor = 0;
-
-  const processBatch = () => {
-    if (runId !== workspaceDiagnosticRun) {
-      return;
-    }
-    const started = Date.now();
-    while (cursor < entries.length && Date.now() - started < 8) {
-      const [filePath, parsed] = entries[cursor];
-      cursor += 1;
-
+    .filter(([filePath]) => state.resolveSource(filePath) === "mod")
+    .map(([filePath, parsed]) => ({ filePath, parsed }));
+  state.scheduleWorkspaceDiagnostics(entries, ({ filePath, parsed }) => {
       const uri = pathToFileURL(filePath).toString();
       if (documents.get(uri)) {
-        continue;
+        return;
       }
 
-      const diagnostics = collectValidationDiagnostics(parsed, filePath);
+      const diagnostics = state.collectIndexedDiagnostics(filePath, parsed);
       connection.sendDiagnostics({
         uri,
         diagnostics,
       });
-    }
-
-    if (cursor < entries.length) {
-      setTimeout(processBatch, 100);
-    }
-  };
-
-  setTimeout(processBatch, 5000);
-}
-
-function collectDocumentDiagnostics(document: TextDocument): Diagnostic[] {
-  const filePath = uriToFsPath(document.uri);
-  const live = state.getLiveDocument(document.uri) ?? {
-    ...createDocumentIndexRecord(filePath, document.getText(), state.resolveSource(filePath)),
-    source: state.resolveSource(filePath),
-  };
-  return collectValidationDiagnostics(live.parsed, filePath, live.symbols, live.references);
-}
-
-function collectValidationDiagnostics(
-  parsed: ParsedDocument,
-  filePath: string,
-  liveSymbols?: SymbolRecord[],
-  liveReferences?: ReferenceRecord[]
-): Diagnostic[] {
-  const symbols = liveSymbols ?? createDocumentIndexRecord(filePath, parsed.text, state.resolveSource(filePath)).symbols;
-  const references = liveReferences ?? collectParsedReferences(parsed);
-  const referencedNames = new Set(references.map((reference) => reference.name));
-  for (const symbol of symbols) {
-    referencedNames.add(symbol.name);
-  }
-  const overlayedSymbols = state.overlaySymbols(pathToFileURL(filePath).toString(), symbols, referencedNames);
-  const validation = validateParsedReferencesAgainstIndex(parsed, references, {
-    ...state.getIndex(),
-    symbols: overlayedSymbols,
-  });
-
-  const diagnostics = validation.map((entry) => ({
-    severity:
-      entry.severity === "error"
-        ? DiagnosticSeverity.Error
-        : entry.severity === "warning"
-          ? DiagnosticSeverity.Warning
-          : DiagnosticSeverity.Information,
-    message: entry.message,
-    range: toLspRange(entry.range),
-    source: "ck3-devkit",
-  }));
-
-  if (parsed.kind === "localization" && state.resolveSource(filePath) === "mod" && !parsed.text.startsWith("\uFEFF")) {
-    diagnostics.push({
-      severity: DiagnosticSeverity.Warning,
-      message: "Localization files should be saved as UTF-8 with BOM.",
-      range: {
-        start: { line: 0, character: 0 },
-        end: { line: 0, character: 1 },
-      },
-      source: "ck3-devkit",
     });
-  }
-
-  return diagnostics;
 }
 
 function symbolsByName(name: string): SymbolRecord[] {
@@ -626,45 +525,7 @@ function allSymbols(query?: string): SymbolRecord[] {
 }
 
 function completionSymbols(kinds: string[], query = "", limit = 100): SymbolRecord[] {
-  const lowered = query.toLowerCase();
-  const matches: SymbolRecord[] = [];
-  const grouped = new Map<string, SymbolRecord[]>();
-
-  for (const symbol of allSymbols()) {
-    const existing = grouped.get(symbol.name) ?? [];
-    existing.push(symbol);
-    grouped.set(symbol.name, existing);
-  }
-
-  for (const records of grouped.values()) {
-    const relevant = records
-      .filter((symbol) => symbolMatchesCompletionKinds(symbol.kind, kinds))
-      .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
-    if (relevant.length === 0) {
-      continue;
-    }
-    const candidate = relevant[0];
-    if (lowered && !candidate.name.toLowerCase().includes(lowered)) {
-      continue;
-    }
-    matches.push(candidate);
-  }
-
-  matches.sort((left, right) => {
-    const leftName = left.name.toLowerCase();
-    const rightName = right.name.toLowerCase();
-    const leftStarts = lowered ? leftName.startsWith(lowered) : false;
-    const rightStarts = lowered ? rightName.startsWith(lowered) : false;
-    if (leftStarts !== rightStarts) {
-      return Number(rightStarts) - Number(leftStarts);
-    }
-    if (left.source !== right.source) {
-      return Number(right.source === "mod") - Number(left.source === "mod");
-    }
-    return left.name.localeCompare(right.name);
-  });
-
-  return matches.slice(0, limit);
+  return state.completionSymbols(kinds, query, limit);
 }
 
 function targetRenameCandidate(documentUri: string, range: Range, name: string): { kind: string; source: SourceKind } | null {
@@ -972,10 +833,6 @@ function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: strin
     }
     return symbolKind === kind;
   });
-}
-
-function matchesCk3Path(uri: string): boolean {
-  return /\.(txt|gui|info|asset|yml)$/i.test(uri);
 }
 
 function uriToFsPath(uri: string): string {

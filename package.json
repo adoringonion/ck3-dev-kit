@@ -135,7 +135,7 @@
     "build": "node ./node_modules/typescript/bin/tsc -p .",
     "watch": "node ./node_modules/typescript/bin/tsc -w -p .",
     "check": "node ./node_modules/typescript/bin/tsc -p . --noEmit",
-    "test": "npm run build && node --test test/core.test.js && node --test test/cli.test.js && node --test test/lsp.test.js && node --test test/backend-manager.test.js",
+    "test": "npm run build && node --test test/core.test.js && node --test test/cli.test.js && node --test test/lsp.test.js",
     "package:vsix": "npm run build && node ./node_modules/@vscode/vsce/vsce package",
     "index": "node dist/cli.js",
     "find-symbol": "node dist/find-symbol.js",
