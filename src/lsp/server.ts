@@ -52,6 +52,12 @@ import {
   toSymbolKind,
   toWorkspaceSymbol,
 } from "./features";
+import {
+  filterModRenameReferences,
+  filterModRenameSymbols,
+  normalizeRenameKind,
+  resolveModRenameTarget,
+} from "./rename";
 
 type SourceKind = "mod" | "reference";
 
@@ -270,8 +276,9 @@ connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams) => 
     return null;
   }
   const name = document.getText(wordRange);
-  const targetKind = targetRenameKind(document.uri, wordRange, name);
-  if (!targetKind) {
+  const candidate = targetRenameCandidate(document.uri, wordRange, name);
+  const target = resolveModRenameTarget(candidate, symbolsByName(name));
+  if (!target) {
     return null;
   }
   return {
@@ -290,12 +297,13 @@ connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): 
     return null;
   }
   const name = document.getText(wordRange);
-  const targetKind = targetRenameKind(document.uri, wordRange, name);
-  if (!targetKind) {
+  const candidate = targetRenameCandidate(document.uri, wordRange, name);
+  const target = resolveModRenameTarget(candidate, symbolsByName(name));
+  if (!target) {
     return null;
   }
-  const symbols = symbolsByName(name).filter((symbol) => renameCompatibleSymbolKind(symbol.kind, targetKind));
-  const references = referencesByName(name).filter((reference) => renameCompatibleReferenceKind(reference.kind, targetKind));
+  const symbols = filterModRenameSymbols(symbolsByName(name), target);
+  const references = filterModRenameReferences(referencesByName(name), target);
   if (symbols.length === 0 && references.length === 0) {
     return null;
   }
@@ -563,7 +571,7 @@ function completionSymbols(kinds: string[], query = "", limit = 100): SymbolReco
   return matches.slice(0, limit);
 }
 
-function targetRenameKind(documentUri: string, range: Range, name: string): string | null {
+function targetRenameCandidate(documentUri: string, range: Range, name: string): { kind: string; source: SourceKind } | null {
   const filePath = uriToFsPath(documentUri);
   const live = liveDocuments.get(documentUri);
   const symbols = (live?.symbols ?? []).filter((symbol) =>
@@ -572,7 +580,10 @@ function targetRenameKind(documentUri: string, range: Range, name: string): stri
     symbol.range.start.character === range.start.character
   );
   if (symbols.length > 0) {
-    return symbols[0].kind;
+    return {
+      kind: normalizeRenameKind(symbols[0].kind),
+      source: symbols[0].source,
+    };
   }
 
   const baseSymbols = (index.symbols.get(name) ?? []).filter((symbol) =>
@@ -581,7 +592,10 @@ function targetRenameKind(documentUri: string, range: Range, name: string): stri
     symbol.range.start.character === range.start.character
   );
   if (baseSymbols.length > 0) {
-    return baseSymbols[0].kind;
+    return {
+      kind: normalizeRenameKind(baseSymbols[0].kind),
+      source: baseSymbols[0].source,
+    };
   }
 
   const references = (live?.references ?? []).filter((reference) =>
@@ -590,7 +604,10 @@ function targetRenameKind(documentUri: string, range: Range, name: string): stri
     reference.range.start.character === range.start.character
   );
   if (references.length > 0) {
-    return normalizeRenameKind(references[0].kind);
+    return {
+      kind: normalizeRenameKind(references[0].kind),
+      source: references[0].source,
+    };
   }
 
   const baseReferences = (index.references.get(name) ?? []).filter((reference) =>
@@ -599,38 +616,13 @@ function targetRenameKind(documentUri: string, range: Range, name: string): stri
     reference.range.start.character === range.start.character
   );
   if (baseReferences.length > 0) {
-    return normalizeRenameKind(baseReferences[0].kind);
+    return {
+      kind: normalizeRenameKind(baseReferences[0].kind),
+      source: baseReferences[0].source,
+    };
   }
 
   return null;
-}
-
-function normalizeRenameKind(kind: string): string {
-  if (
-    kind === "character_modifier" ||
-    kind === "county_modifier" ||
-    kind === "province_modifier" ||
-    kind === "artifact_modifier"
-  ) {
-    return "modifier";
-  }
-  return kind;
-}
-
-function renameCompatibleSymbolKind(symbolKind: string, targetKind: string): boolean {
-  const normalized = normalizeRenameKind(symbolKind);
-  return normalized === targetKind;
-}
-
-function renameCompatibleReferenceKind(referenceKind: string, targetKind: string): boolean {
-  const normalized = normalizeRenameKind(referenceKind);
-  if (targetKind === "religion" && normalized === "faith") {
-    return true;
-  }
-  if (targetKind === "faith" && normalized === "religion") {
-    return true;
-  }
-  return normalized === targetKind;
 }
 
 function preferredLocalizationFile(): string | null {
