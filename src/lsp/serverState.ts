@@ -1,6 +1,6 @@
 import * as path from "path";
 import { pathToFileURL } from "url";
-import { Diagnostic, DiagnosticSeverity, Hover } from "vscode-languageserver/node";
+import { Diagnostic, DiagnosticSeverity, Hover, InlayHint, SemanticTokens } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { createDocumentIndexRecord, WorkspaceIndex } from "../core/indexer";
 import { collectParsedReferences, validateParsedReferencesAgainstIndex } from "../core/references";
@@ -16,6 +16,7 @@ export interface ServerConfig {
 }
 
 export interface LiveDocumentRecord {
+  version: number;
   parsed: ParsedDocument;
   symbols: SymbolRecord[];
   references: ReferenceRecord[];
@@ -33,6 +34,12 @@ interface DiagnosticCacheEntry {
   diagnostics: Diagnostic[];
 }
 
+interface VersionedCacheEntry<T> {
+  version: number;
+  indexRevision: number;
+  value: T;
+}
+
 export class ServerState {
   private config: ServerConfig = {
     modRoots: [],
@@ -46,10 +53,15 @@ export class ServerState {
     documents: new Map(),
     files: [],
   };
+  private indexedSymbolsByPath = new Map<string, SymbolRecord[]>();
+  private indexedReferencesByPath = new Map<string, ReferenceRecord[]>();
 
   private liveDocuments = new Map<string, LiveDocumentRecord>();
   private diagnosticCache = new Map<string, DiagnosticCacheEntry>();
   private hoverCache = new Map<string, Hover | null>();
+  private inlayHintCache = new Map<string, VersionedCacheEntry<InlayHint[]>>();
+  private semanticTokenCache = new Map<string, VersionedCacheEntry<SemanticTokens>>();
+  private analysisTimers = new Map<string, NodeJS.Timeout>();
   private diagnosticTimers = new Map<string, NodeJS.Timeout>();
   private workspaceDiagnosticRun = 0;
   private indexRevision = 0;
@@ -66,6 +78,8 @@ export class ServerState {
 
   setIndex(index: WorkspaceIndex): void {
     this.index = index;
+    this.indexedSymbolsByPath = groupSymbolsByPath(index.symbols);
+    this.indexedReferencesByPath = groupReferencesByPath(index.references);
     this.indexRevision += 1;
     this.indexReady = true;
     this.lastIndexError = null;
@@ -105,21 +119,45 @@ export class ServerState {
   setLiveDocument(document: TextDocument, source: SourceKind): LiveDocumentRecord {
     const filePath = uriToFsPath(document.uri);
     const record = {
+      version: document.version,
       ...createDocumentIndexRecord(filePath, document.getText(), source),
       source,
     };
     this.liveDocuments.set(document.uri, record);
+    this.clearDocumentFeatureCaches(document.uri);
+    return record;
+  }
+
+  hydrateLiveDocumentFromIndex(document: TextDocument, source: SourceKind): LiveDocumentRecord | null {
+    const filePath = uriToFsPath(document.uri);
+    const parsed = this.index.documents.get(filePath);
+    if (!parsed || parsed.text !== document.getText()) {
+      return null;
+    }
+    const record: LiveDocumentRecord = {
+      version: document.version,
+      parsed,
+      symbols: this.indexedSymbolsByPath.get(filePath) ?? [],
+      references: this.indexedReferencesByPath.get(filePath) ?? [],
+      source,
+    };
+    this.liveDocuments.set(document.uri, record);
+    this.clearDocumentFeatureCaches(document.uri);
     return record;
   }
 
   deleteLiveDocument(uri: string): void {
     this.liveDocuments.delete(uri);
     this.deleteDiagnosticCache(uri);
-    this.clearHoverCacheForUri(uri);
+    this.clearDocumentFeatureCaches(uri);
   }
 
   getLiveDocument(uri: string): LiveDocumentRecord | undefined {
     return this.liveDocuments.get(uri);
+  }
+
+  hasCurrentAnalysis(document: TextDocument): boolean {
+    return this.liveDocuments.get(document.uri)?.version === document.version;
   }
 
   liveDocumentEntries(): IterableIterator<[string, LiveDocumentRecord]> {
@@ -182,11 +220,52 @@ export class ServerState {
     }
   }
 
+  getInlayHintCache(uri: string, version: number): InlayHint[] | undefined {
+    const cached = this.inlayHintCache.get(uri);
+    if (cached && cached.version === version && cached.indexRevision === this.indexRevision) {
+      return cached.value;
+    }
+    return undefined;
+  }
+
+  setInlayHintCache(uri: string, version: number, hints: InlayHint[]): void {
+    this.inlayHintCache.set(uri, {
+      version,
+      indexRevision: this.indexRevision,
+      value: hints,
+    });
+  }
+
+  getSemanticTokenCache(uri: string, version: number): SemanticTokens | undefined {
+    const cached = this.semanticTokenCache.get(uri);
+    if (cached && cached.version === version && cached.indexRevision === this.indexRevision) {
+      return cached.value;
+    }
+    return undefined;
+  }
+
+  setSemanticTokenCache(uri: string, version: number, tokens: SemanticTokens): void {
+    this.semanticTokenCache.set(uri, {
+      version,
+      indexRevision: this.indexRevision,
+      value: tokens,
+    });
+  }
+
   clearTransientState(): void {
     this.diagnosticCache.clear();
     this.hoverCache.clear();
+    this.inlayHintCache.clear();
+    this.semanticTokenCache.clear();
+    this.cancelAllDocumentAnalysis();
     this.cancelAllDocumentDiagnostics();
     this.cancelWorkspaceDiagnostics();
+  }
+
+  clearDocumentFeatureCaches(uri: string): void {
+    this.clearHoverCacheForUri(uri);
+    this.inlayHintCache.delete(uri);
+    this.semanticTokenCache.delete(uri);
   }
 
   symbolsByName(name: string): SymbolRecord[] {
@@ -264,7 +343,36 @@ export class ServerState {
     return this.config.referenceRoots.some((root) => filePath.startsWith(root)) ? "reference" : "mod";
   }
 
-  syncDocument(document: TextDocument): LiveDocumentRecord | null {
+  openDocument(document: TextDocument): LiveDocumentRecord | null {
+    const filePath = uriToFsPath(document.uri);
+    if (!matchesCk3Path(filePath)) {
+      this.deleteLiveDocument(document.uri);
+      return null;
+    }
+    const source = this.resolveSource(filePath);
+    const current = this.liveDocuments.get(document.uri);
+    if (current?.version === document.version) {
+      return current;
+    }
+    const hydrated = this.hydrateLiveDocumentFromIndex(document, source);
+    if (hydrated) {
+      return hydrated;
+    }
+    return null;
+  }
+
+  markDocumentChanged(document: TextDocument): void {
+    const filePath = uriToFsPath(document.uri);
+    if (!matchesCk3Path(filePath)) {
+      this.deleteLiveDocument(document.uri);
+      return;
+    }
+    this.liveDocuments.delete(document.uri);
+    this.deleteDiagnosticCache(document.uri);
+    this.clearDocumentFeatureCaches(document.uri);
+  }
+
+  analyzeDocument(document: TextDocument): LiveDocumentRecord | null {
     const filePath = uriToFsPath(document.uri);
     if (!matchesCk3Path(filePath)) {
       this.deleteLiveDocument(document.uri);
@@ -274,6 +382,27 @@ export class ServerState {
     return this.setLiveDocument(document, source);
   }
 
+  applyAnalyzedDocument(
+    uri: string,
+    version: number,
+    source: SourceKind,
+    parsed: ParsedDocument,
+    symbols: SymbolRecord[],
+    references: ReferenceRecord[]
+  ): LiveDocumentRecord {
+    const record: LiveDocumentRecord = {
+      version,
+      parsed,
+      symbols,
+      references,
+      source,
+    };
+    this.liveDocuments.set(uri, record);
+    this.deleteDiagnosticCache(uri);
+    this.clearDocumentFeatureCaches(uri);
+    return record;
+  }
+
   collectDocumentDiagnostics(document: TextDocument): Diagnostic[] {
     const cached = this.getDiagnosticCache(document.uri);
     if (cached && cached.version === document.version && cached.indexRevision === this.indexRevision) {
@@ -281,10 +410,10 @@ export class ServerState {
     }
 
     const filePath = uriToFsPath(document.uri);
-    const live = this.getLiveDocument(document.uri) ?? this.syncDocument(document) ?? {
-      ...createDocumentIndexRecord(filePath, document.getText(), this.resolveSource(filePath)),
-      source: this.resolveSource(filePath),
-    };
+    const live = this.getLiveDocument(document.uri);
+    if (!live || live.version !== document.version) {
+      return [];
+    }
     const diagnostics = this.collectValidationDiagnostics(filePath, live.parsed, live.symbols, live.references);
     this.setDiagnosticCache(document.uri, document.version, diagnostics);
     return diagnostics;
@@ -498,6 +627,31 @@ export class ServerState {
     this.diagnosticTimers.clear();
   }
 
+  scheduleDocumentAnalysis(uri: string, delayMs: number, analyze: () => void): void {
+    this.cancelDocumentAnalysis(uri);
+    const timer = setTimeout(() => {
+      this.analysisTimers.delete(uri);
+      analyze();
+    }, delayMs);
+    this.analysisTimers.set(uri, timer);
+  }
+
+  cancelDocumentAnalysis(uri: string): void {
+    const timer = this.analysisTimers.get(uri);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    this.analysisTimers.delete(uri);
+  }
+
+  cancelAllDocumentAnalysis(): void {
+    for (const timer of this.analysisTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.analysisTimers.clear();
+  }
+
   scheduleWorkspaceDiagnostics<TEntry>(
     entries: TEntry[],
     processEntry: (entry: TEntry) => void,
@@ -624,6 +778,30 @@ function fsExists(filePath: string): boolean {
   }
 }
 
+function groupSymbolsByPath(indexedSymbols: Map<string, SymbolRecord[]>): Map<string, SymbolRecord[]> {
+  const grouped = new Map<string, SymbolRecord[]>();
+  for (const entries of indexedSymbols.values()) {
+    for (const entry of entries) {
+      const existing = grouped.get(entry.path) ?? [];
+      existing.push(entry);
+      grouped.set(entry.path, existing);
+    }
+  }
+  return grouped;
+}
+
+function groupReferencesByPath(indexedReferences: Map<string, ReferenceRecord[]>): Map<string, ReferenceRecord[]> {
+  const grouped = new Map<string, ReferenceRecord[]>();
+  for (const entries of indexedReferences.values()) {
+    for (const entry of entries) {
+      const existing = grouped.get(entry.path) ?? [];
+      existing.push(entry);
+      grouped.set(entry.path, existing);
+    }
+  }
+  return grouped;
+}
+
 export class ServerSnapshot {
   constructor(private readonly state: ServerState) {}
 
@@ -685,5 +863,21 @@ export class ServerSnapshot {
 
   localizationLanguage(symbol: SymbolRecord): string | null | undefined {
     return this.state.localizationLanguage(symbol);
+  }
+
+  inlayHintCache(uri: string, version: number): InlayHint[] | undefined {
+    return this.state.getInlayHintCache(uri, version);
+  }
+
+  setInlayHintCache(uri: string, version: number, hints: InlayHint[]): void {
+    this.state.setInlayHintCache(uri, version, hints);
+  }
+
+  semanticTokenCache(uri: string, version: number): SemanticTokens | undefined {
+    return this.state.getSemanticTokenCache(uri, version);
+  }
+
+  setSemanticTokenCache(uri: string, version: number, tokens: SemanticTokens): void {
+    this.state.setSemanticTokenCache(uri, version, tokens);
   }
 }

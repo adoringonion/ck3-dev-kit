@@ -29,7 +29,6 @@ import { pathToFileURL } from "url";
 import { Worker } from "worker_threads";
 import { WorkspaceIndex } from "../core/indexer";
 import { analyzeErrorLogFile } from "../core/errorLog";
-import { parseDocumentText } from "../core/document";
 import { ParsedDocument, AssignmentNode, ReferenceRecord, SymbolRecord } from "../core/types";
 import { getScriptSyntaxHelp, SyntaxHelpContext } from "../extension/dynamicReferenceHelp";
 import { inferCompletionContext } from "../extension/completion";
@@ -71,6 +70,11 @@ const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 const state = new ServerState();
 let indexBuildPromise: Promise<void> | null = null;
+const WORKSPACE_DIAGNOSTIC_IDLE_DELAY_MS = 15000;
+const WORKSPACE_DIAGNOSTIC_BATCH_BUDGET_MS = 4;
+const WORKSPACE_DIAGNOSTIC_BATCH_INTERVAL_MS = 250;
+const activeDocumentWorkers = new Map<string, { version: number; worker: Worker }>();
+const cancelledDocumentWorkers = new WeakSet<Worker>();
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   state.setConfig(normalizeConfig(params.initializationOptions));
@@ -104,7 +108,10 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 connection.onInitialized(() => {
   void rebuildIndex("startup");
   for (const document of documents.all()) {
-    state.syncDocument(document);
+    state.openDocument(document);
+    if (!state.hasCurrentAnalysis(document)) {
+      scheduleAnalysis(document, 50);
+    }
   }
 });
 
@@ -132,10 +139,11 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
     return cached;
   }
 
-  const parsed = snapshot.parsedDocumentForUri(document.uri)
-    ?? parseDocumentText(uriToFsPath(document.uri), document.getText());
+  const parsed = currentParsedDocument(snapshot, document);
   const name = document.getText(wordRange);
-  const syntaxHelp = getScriptSyntaxHelp(name, parsed.kind === "script" ? syntaxHelpContextAt(parsed, wordRange) : undefined);
+  const syntaxHelp = parsed
+    ? getScriptSyntaxHelp(name, parsed.kind === "script" ? syntaxHelpContextAt(parsed, wordRange) : undefined)
+    : getScriptSyntaxHelp(name);
   if (syntaxHelp) {
     const hover = {
       contents: {
@@ -245,7 +253,11 @@ connection.onDocumentSymbol(({ textDocument }) => {
     return [];
   }
 
-  const parsed = parseDocumentText(uriToFsPath(document.uri), document.getText());
+  const snapshot = state.snapshot();
+  const parsed = currentParsedDocument(snapshot, document);
+  if (!parsed) {
+    return [];
+  }
   if (parsed.kind !== "script") {
     return [];
   }
@@ -316,7 +328,10 @@ connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): 
   return buildRenameWorkspaceEdit(newName, symbols, references);
 });
 
-connection.onCodeAction((params): CodeAction[] => {
+connection.onCodeAction((params): CodeAction[] => timeRequest("codeAction", () => {
+  if (!params.context.diagnostics.some(isActionableDiagnostic)) {
+    return [];
+  }
   const actions: CodeAction[] = [];
   const document = documents.get(params.textDocument.uri);
   for (const diagnostic of params.context.diagnostics) {
@@ -375,25 +390,45 @@ connection.onCodeAction((params): CodeAction[] => {
     }
   }
   return actions;
-});
+}));
 
-connection.languages.inlayHint.on(({ textDocument }): InlayHint[] => {
+connection.languages.inlayHint.on(({ textDocument }): InlayHint[] => timeRequest("inlayHint", () => {
   const document = documents.get(textDocument.uri);
   if (!document) {
     return [];
   }
-  const parsed = parseDocumentText(uriToFsPath(document.uri), document.getText());
-  return buildInlayHints(parsed, uriToFsPath(document.uri), state.snapshot().allSymbols());
-});
+  const snapshot = state.snapshot();
+  const cached = snapshot.inlayHintCache(document.uri, document.version);
+  if (cached) {
+    return cached;
+  }
+  const parsed = currentParsedDocument(snapshot, document);
+  if (!parsed) {
+    return [];
+  }
+  const hints = buildInlayHints(parsed, uriToFsPath(document.uri), snapshot.allSymbols());
+  snapshot.setInlayHintCache(document.uri, document.version, hints);
+  return hints;
+}));
 
-connection.languages.semanticTokens.on(({ textDocument }): SemanticTokens => {
+connection.languages.semanticTokens.on(({ textDocument }): SemanticTokens => timeRequest("semanticTokens", () => {
   const document = documents.get(textDocument.uri);
   if (!document) {
     return { data: [] };
   }
-  const parsed = parseDocumentText(uriToFsPath(document.uri), document.getText());
-  return buildSemanticTokens(parsed);
-});
+  const snapshot = state.snapshot();
+  const cached = snapshot.semanticTokenCache(document.uri, document.version);
+  if (cached) {
+    return cached;
+  }
+  const parsed = currentParsedDocument(snapshot, document);
+  if (!parsed) {
+    return { data: [] };
+  }
+  const tokens = buildSemanticTokens(parsed);
+  snapshot.setSemanticTokenCache(document.uri, document.version, tokens);
+  return tokens;
+}));
 
 connection.onNotification(REBUILD_INDEX_NOTIFICATION, () => {
   void rebuildIndex("manual command");
@@ -410,21 +445,30 @@ connection.onRequest(ANALYZE_ERROR_LOG_REQUEST, (params: AnalyzeErrorLogParams |
 });
 
 documents.onDidOpen((event) => {
-  state.syncDocument(event.document);
+  state.openDocument(event.document);
+  if (!state.hasCurrentAnalysis(event.document)) {
+    scheduleAnalysis(event.document, 50);
+  }
   scheduleDiagnostics(event.document, 2000);
+  rescheduleWorkspaceDiagnostics();
 });
 
 documents.onDidChangeContent((event) => {
-  state.syncDocument(event.document);
+  state.markDocumentChanged(event.document);
   clearHoverCacheForUri(event.document.uri);
+  scheduleAnalysis(event.document, 150);
   scheduleDiagnostics(event.document, 750);
+  rescheduleWorkspaceDiagnostics();
 });
 
 documents.onDidClose((event) => {
+  cancelDocumentWorker(event.document.uri);
+  state.cancelDocumentAnalysis(event.document.uri);
   state.cancelDocumentDiagnostics(event.document.uri);
   clearHoverCacheForUri(event.document.uri);
   state.deleteLiveDocument(event.document.uri);
   connection.sendDiagnostics({ uri: event.document.uri, diagnostics: [] });
+  rescheduleWorkspaceDiagnostics();
 });
 
 documents.listen(connection);
@@ -456,6 +500,7 @@ async function rebuildIndex(reason: string): Promise<void> {
     sendIndexStatus({ phase: "started", reason });
     progress.begin("CK3 Mod DevKit", undefined, `Building symbol index (${reason})`, false);
     state.markIndexRebuilding();
+    cancelAllDocumentWorkers();
     try {
       const nextIndex = await buildIndexInWorker(state.getConfig());
       state.setIndex(nextIndex);
@@ -473,10 +518,13 @@ async function rebuildIndex(reason: string): Promise<void> {
     }
 
     for (const document of documents.all()) {
-      state.syncDocument(document);
+      state.openDocument(document);
+      if (!state.hasCurrentAnalysis(document)) {
+        scheduleAnalysis(document, 50);
+      }
       scheduleDiagnostics(document, 750);
     }
-    scheduleWorkspaceDiagnostics();
+    rescheduleWorkspaceDiagnostics();
   })();
 
   await indexBuildPromise;
@@ -493,6 +541,14 @@ function publishDiagnostics(document: TextDocument): void {
 function scheduleDiagnostics(document: TextDocument, delayMs: number): void {
   state.scheduleDocumentDiagnostics(document.uri, delayMs, () => {
     publishDiagnostics(document);
+  });
+}
+
+function scheduleAnalysis(document: TextDocument, delayMs: number): void {
+  state.scheduleDocumentAnalysis(document.uri, delayMs, () => {
+    void analyzeDocumentInWorker(document).catch((error) => {
+      connection.console.error(`[analysis] ${document.uri}: ${error instanceof Error ? error.message : String(error)}`);
+    });
   });
 }
 
@@ -515,7 +571,16 @@ function scheduleWorkspaceDiagnostics(): void {
         uri,
         diagnostics,
       });
+    }, {
+      initialDelayMs: WORKSPACE_DIAGNOSTIC_IDLE_DELAY_MS,
+      batchBudgetMs: WORKSPACE_DIAGNOSTIC_BATCH_BUDGET_MS,
+      batchIntervalMs: WORKSPACE_DIAGNOSTIC_BATCH_INTERVAL_MS,
     });
+}
+
+function rescheduleWorkspaceDiagnostics(): void {
+  state.cancelWorkspaceDiagnostics();
+  scheduleWorkspaceDiagnostics();
 }
 
 function targetRenameCandidate(snapshot: ServerSnapshot, documentUri: string, range: Range, name: string): { kind: string; source: SourceKind } | null {
@@ -595,6 +660,20 @@ function recentDocumentText(document: TextDocument, position: Position): string 
   const start = document.offsetAt({ line: startLine, character: 0 });
   const end = document.offsetAt(position);
   return document.getText().slice(start, end);
+}
+
+function currentParsedDocument(snapshot: ServerSnapshot, document: TextDocument): ParsedDocument | undefined {
+  if (!state.hasCurrentAnalysis(document)) {
+    return undefined;
+  }
+  return snapshot.parsedDocumentForUri(document.uri);
+}
+
+function isActionableDiagnostic(diagnostic: Diagnostic): boolean {
+  return diagnostic.message === "Localization files should be saved as UTF-8 with BOM."
+    || /^Unresolved localization reference: /.test(diagnostic.message)
+    || /^Unresolved event reference: /.test(diagnostic.message)
+    || /^Unresolved (scripted_effect|scripted_trigger|script_value) reference: /.test(diagnostic.message);
 }
 
 function toLocation(symbol: SymbolRecord): Location {
@@ -677,6 +756,119 @@ async function buildIndexInWorker(currentConfig: ServerConfig): Promise<Workspac
       }
     });
   });
+}
+
+async function analyzeDocumentInWorker(document: TextDocument): Promise<void> {
+  const current = documents.get(document.uri);
+  if (!current) {
+    return;
+  }
+  const version = current.version;
+  const filePath = uriToFsPath(current.uri);
+  const source = state.resolveSource(filePath);
+  const workerPath = path.join(__dirname, "documentWorker.js");
+
+  const result = await new Promise<{
+    parsed: ParsedDocument;
+    symbols: SymbolRecord[];
+    references: ReferenceRecord[];
+  }>((resolve, reject) => {
+    cancelStaleDocumentWorker(document.uri, version);
+    const worker = new Worker(workerPath, {
+      workerData: {
+        filePath,
+        text: current.getText(),
+        source,
+      },
+    });
+    activeDocumentWorkers.set(document.uri, { version, worker });
+
+    worker.once("message", (message: {
+      ok: boolean;
+      record?: {
+        parsed: ParsedDocument;
+        symbols: SymbolRecord[];
+        references: ReferenceRecord[];
+      };
+      error?: string;
+    }) => {
+      clearDocumentWorker(document.uri, version, worker);
+      worker.terminate().catch(() => undefined);
+      if (!message.ok || !message.record) {
+        reject(new Error(message.error ?? "Unknown document worker failure."));
+        return;
+      }
+      resolve(message.record);
+    });
+
+    worker.once("error", (error) => {
+      clearDocumentWorker(document.uri, version, worker);
+      if (cancelledDocumentWorkers.has(worker)) {
+        return;
+      }
+      worker.terminate().catch(() => undefined);
+      reject(error);
+    });
+
+    worker.once("exit", (code) => {
+      clearDocumentWorker(document.uri, version, worker);
+      if (cancelledDocumentWorkers.has(worker)) {
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`Document worker exited with code ${code}.`));
+      }
+    });
+  });
+
+  const latest = documents.get(document.uri);
+  if (!latest || latest.version !== version) {
+    return;
+  }
+
+  state.applyAnalyzedDocument(document.uri, version, source, result.parsed, result.symbols, result.references);
+  scheduleDiagnostics(latest, 50);
+}
+
+function cancelStaleDocumentWorker(uri: string, nextVersion: number): void {
+  const active = activeDocumentWorkers.get(uri);
+  if (!active) {
+    return;
+  }
+  if (active.version >= nextVersion) {
+    return;
+  }
+  activeDocumentWorkers.delete(uri);
+  cancelledDocumentWorkers.add(active.worker);
+  active.worker.terminate().catch(() => undefined);
+}
+
+function cancelDocumentWorker(uri: string): void {
+  const active = activeDocumentWorkers.get(uri);
+  if (!active) {
+    return;
+  }
+  activeDocumentWorkers.delete(uri);
+  cancelledDocumentWorkers.add(active.worker);
+  active.worker.terminate().catch(() => undefined);
+}
+
+function cancelAllDocumentWorkers(): void {
+  for (const [uri, active] of activeDocumentWorkers.entries()) {
+    activeDocumentWorkers.delete(uri);
+    cancelledDocumentWorkers.add(active.worker);
+    active.worker.terminate().catch(() => undefined);
+  }
+}
+
+function clearDocumentWorker(uri: string, version: number, worker: Worker): void {
+  const active = activeDocumentWorkers.get(uri);
+  if (!active) {
+    return;
+  }
+  if (active.version === version && active.worker === worker) {
+    activeDocumentWorkers.delete(uri);
+  }
 }
 
 function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: string[]): boolean {

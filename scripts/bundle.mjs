@@ -27,3 +27,9 @@ await build({
   entryPoints: ["src/lsp/indexWorker.ts"],
   outfile: "dist/lsp/indexWorker.js",
 });
+
+await build({
+  ...shared,
+  entryPoints: ["src/lsp/documentWorker.ts"],
+  outfile: "dist/lsp/documentWorker.js",
+});
