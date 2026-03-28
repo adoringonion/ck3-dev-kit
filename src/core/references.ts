@@ -38,6 +38,14 @@ export function validateReferences(index: WorkspaceIndex, filePath?: string): Re
 }
 
 export function validateParsedDocumentAgainstIndex(parsed: ParsedDocument, index: WorkspaceIndex): ReferenceValidationRecord[] {
+  return validateParsedReferencesAgainstIndex(parsed, collectParsedReferences(parsed), index);
+}
+
+export function validateParsedReferencesAgainstIndex(
+  parsed: ParsedDocument,
+  references: ReferenceRecord[],
+  index: WorkspaceIndex
+): ReferenceValidationRecord[] {
   const diagnostics: ReferenceValidationRecord[] = [];
   const seen = new Set<string>();
   for (const diagnostic of collectDocumentDiagnostics(parsed)) {
@@ -48,7 +56,7 @@ export function validateParsedDocumentAgainstIndex(parsed: ParsedDocument, index
     });
   }
 
-  for (const reference of extractReferencesFromParsedDocument(parsed)) {
+  for (const reference of references) {
     if (hasMatchingDefinition(index, reference)) {
       continue;
     }
@@ -67,6 +75,10 @@ export function validateParsedDocumentAgainstIndex(parsed: ParsedDocument, index
   }
 
   return diagnostics;
+}
+
+export function collectParsedReferences(parsed: ParsedDocument): ReferenceRecord[] {
+  return extractReferencesFromParsedDocument(parsed);
 }
 
 function* collectReferences(index: WorkspaceIndex, filePath?: string): Iterable<ReferenceRecord> {

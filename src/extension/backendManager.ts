@@ -1,5 +1,6 @@
 export interface LanguageClientLike {
   sendNotification(method: string): Promise<void>;
+  sendRequest<TResult>(method: string, params?: unknown): Promise<TResult>;
   stop(): Promise<void>;
 }
 
@@ -73,6 +74,10 @@ export class BackendManager<TClient extends LanguageClientLike> {
 
   hasLanguageClient(): boolean {
     return this.languageClient !== undefined;
+  }
+
+  getLanguageClient(): TClient | undefined {
+    return this.languageClient;
   }
 
   private async stopLanguageServer(): Promise<void> {

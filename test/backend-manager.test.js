@@ -41,6 +41,9 @@ test("BackendManager disposes fallback providers after language server recovery"
       async sendNotification() {
         notifyCalls += 1;
       },
+      async sendRequest() {
+        return null;
+      },
       async stop() {
         stopCalls += 1;
       },

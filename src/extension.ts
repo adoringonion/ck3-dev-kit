@@ -1,38 +1,34 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
 import { LanguageClient } from "vscode-languageclient/node";
-import { buildCachedWorkspaceIndex } from "./cli-shared";
-import { analyzeErrorLogFile } from "./core/errorLog";
 import { BackendManager } from "./extension/backendManager";
 import { IndexStore } from "./extension/indexStore";
 import { registerProviders } from "./extension/providers";
 import { writeWorkspaceAssociations } from "./extension/workspaceSettings";
 import { readConfig } from "./extension/config";
 import { createLanguageClient } from "./lsp/client";
+import {
+  ANALYZE_ERROR_LOG_REQUEST,
+  AnalyzeErrorLogResponse,
+  INDEX_STATUS_NOTIFICATION,
+  IndexStatusPayload,
+} from "./lsp/protocol";
 
 let activeBackendManager: BackendManager<LanguageClient> | undefined;
 
-type IndexPhase = "started" | "completed" | "failed" | "busy";
-
-interface IndexStatusPayload {
-  phase: IndexPhase;
-  reason: string;
-  message?: string;
-}
-
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const fallbackStore = new IndexStore();
   const output = vscode.window.createOutputChannel("CK3 Mod DevKit");
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.name = "CK3 Mod DevKit";
   context.subscriptions.push(output);
   context.subscriptions.push(statusBar);
   let indexBusy = false;
+  let fallbackStore: IndexStore | undefined;
 
   const backendManager = new BackendManager<LanguageClient>({
     createLanguageClient: async () => {
       const nextClient = createLanguageClient(context, readConfig(), output);
-      nextClient.onNotification("ck3/indexStatus", (payload: IndexStatusPayload) => {
+      nextClient.onNotification(INDEX_STATUS_NOTIFICATION, (payload: IndexStatusPayload) => {
         const timestamp = `[${new Date().toISOString()}]`;
         if (payload.phase === "started") {
           indexBusy = true;
@@ -76,8 +72,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.appendLine(`[${new Date().toISOString()}] Language server started.`);
       return nextClient;
     },
-    registerFallbackProviders: () => registerProviders(context, fallbackStore),
-    rebuildFallbackIndex: () => fallbackStore.rebuild(),
+    registerFallbackProviders: () => {
+      fallbackStore ??= new IndexStore();
+      return registerProviders(context, fallbackStore);
+    },
+    rebuildFallbackIndex: async () => {
+      fallbackStore ??= new IndexStore();
+      await fallbackStore.rebuild();
+    },
   });
   activeBackendManager = backendManager;
 
@@ -135,12 +137,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
-      const index = buildCachedWorkspaceIndex(config);
-      const analysis = analyzeErrorLogFile({
+      const client = backendManager.getLanguageClient();
+      if (!client) {
+        void vscode.window.showWarningMessage("CK3 Mod DevKit language server is not running. error.log analysis is unavailable in fallback mode.");
+        return;
+      }
+      const analysis = await client.sendRequest<AnalyzeErrorLogResponse>(ANALYZE_ERROR_LOG_REQUEST, {
         logPath: config.errorLogPath,
-        modRoots: config.modRoots,
-        referenceRoots: config.referenceRoots,
-        index,
       });
 
       output.appendLine(`[${new Date().toISOString()}] Analyzed error.log: ${analysis.file}`);
