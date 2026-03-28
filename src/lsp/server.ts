@@ -147,9 +147,7 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
     return hover;
   }
 
-  const definitions = symbolsByName(name)
-    .filter((item) => item.kind !== "localization-reference")
-    .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
+  const definitions = state.definitionSymbols(name);
   const target = definitions[0];
   if (!target) {
     state.setHoverCache(cacheKey, null);
@@ -186,9 +184,7 @@ connection.onDefinition(({ textDocument, position }): Definition | null => timeR
   }
 
   const name = document.getText(wordRange);
-  const relevant = symbolsByName(name)
-    .filter((symbol) => symbol.kind !== "localization-reference")
-    .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
+  const relevant = state.definitionSymbols(name);
   if (relevant.length === 0) {
     return null;
   }
@@ -266,8 +262,7 @@ connection.onDocumentSymbol(({ textDocument }) => {
 });
 
 connection.onWorkspaceSymbol(({ query }: WorkspaceSymbolParams): SymbolInformation[] => {
-  return allSymbols(query)
-    .filter((symbol) => symbol.kind !== "localization-reference")
+  return state.workspaceSymbols(query)
     .map((symbol) => toWorkspaceSymbol(symbol) as SymbolInformation);
 });
 
@@ -451,18 +446,23 @@ async function rebuildIndex(reason: string): Promise<void> {
   }
 
   indexBuildPromise = (async () => {
+    const progress = await connection.window.createWorkDoneProgress();
     sendIndexStatus({ phase: "started", reason });
+    progress.begin("CK3 Mod DevKit", undefined, `Building symbol index (${reason})`, false);
     state.markIndexRebuilding();
     try {
       const nextIndex = await buildIndexInWorker(state.getConfig());
       state.setIndex(nextIndex);
+      progress.report("Syncing open documents");
       sendIndexStatus({ phase: "completed", reason });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       state.markIndexFailed(message);
+      progress.report("Index build failed");
       sendIndexStatus({ phase: "failed", reason, message });
       throw error;
     } finally {
+      progress.done();
       indexBuildPromise = null;
     }
 

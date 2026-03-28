@@ -332,6 +332,20 @@ export class ServerState {
     return matches.slice(0, limit);
   }
 
+  definitionSymbols(name: string): SymbolRecord[] {
+    return this.symbolsByName(name)
+      .filter((symbol) => symbol.kind !== "localization-reference")
+      .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
+  }
+
+  preferredDefinition(name: string): SymbolRecord | undefined {
+    return this.definitionSymbols(name)[0];
+  }
+
+  workspaceSymbols(query?: string): SymbolRecord[] {
+    return this.allSymbols(query).filter((symbol) => symbol.kind !== "localization-reference");
+  }
+
   preferredLocalizationFile(): string | null {
     for (const root of this.config.modRoots) {
       const folder = path.join(root, "localization");
