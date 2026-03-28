@@ -130,7 +130,24 @@ export class ServerState {
   }
 
   snapshot(): ServerSnapshot {
-    return new ServerSnapshot(this);
+    const liveDocuments = new Map(this.liveDocuments);
+    const parsedByUri = new Map<string, ParsedDocument>();
+    const parsedByPath = new Map(this.index.documents);
+
+    for (const [uri, record] of liveDocuments.entries()) {
+      parsedByUri.set(uri, record.parsed);
+      parsedByPath.set(uriToFsPath(uri), record.parsed);
+    }
+
+    return new ServerSnapshot(this, {
+      indexReady: this.indexReady,
+      lastIndexError: this.lastIndexError,
+      symbolState: this.getDerivedSymbols(),
+      referenceState: this.getDerivedReferences(),
+      liveDocuments,
+      parsedByUri,
+      parsedByPath,
+    });
   }
 
   setLiveDocument(document: TextDocument, source: SourceKind): LiveDocumentRecord {
@@ -891,14 +908,25 @@ function groupReferencesByPath(indexedReferences: Map<string, ReferenceRecord[]>
 }
 
 export class ServerSnapshot {
-  constructor(private readonly state: ServerState) {}
+  constructor(
+    private readonly state: ServerState,
+    private readonly view: {
+      indexReady: boolean;
+      lastIndexError: string | null;
+      symbolState: DerivedSymbolState;
+      referenceState: DerivedReferenceState;
+      liveDocuments: Map<string, LiveDocumentRecord>;
+      parsedByUri: Map<string, ParsedDocument>;
+      parsedByPath: Map<string, ParsedDocument>;
+    },
+  ) {}
 
   isIndexReady(): boolean {
-    return this.state.isIndexReady();
+    return this.view.indexReady;
   }
 
   getLastIndexError(): string | null {
-    return this.state.getLastIndexError();
+    return this.view.lastIndexError;
   }
 
   getHoverCache(key: string): Hover | null | undefined {
@@ -910,27 +938,39 @@ export class ServerSnapshot {
   }
 
   parsedDocumentForUri(uri: string): ParsedDocument | undefined {
-    return this.state.getParsedDocumentForUri(uri);
+    return this.view.parsedByUri.get(uri);
   }
 
   symbolsByName(name: string): SymbolRecord[] {
-    return this.state.symbolsByName(name);
+    return this.view.symbolState.byName.get(name) ?? [];
   }
 
   referencesByName(name: string): ReferenceRecord[] {
-    return this.state.referencesByName(name);
+    return this.view.referenceState.byName.get(name) ?? [];
   }
 
   definitionSymbols(name: string): SymbolRecord[] {
-    return this.state.definitionSymbols(name);
+    return this.symbolsByName(name)
+      .filter((symbol) => symbol.kind !== "localization-reference")
+      .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
   }
 
   workspaceSymbols(query?: string): SymbolRecord[] {
-    return this.state.workspaceSymbols(query);
+    if (!query) {
+      return this.view.symbolState.all.filter((symbol) => symbol.kind !== "localization-reference");
+    }
+    const lowered = query.toLowerCase();
+    return this.view.symbolState.all
+      .filter((symbol) => symbol.kind !== "localization-reference")
+      .filter((symbol) => symbol.name.toLowerCase().includes(lowered));
   }
 
   allSymbols(query?: string): SymbolRecord[] {
-    return this.state.allSymbols(query);
+    if (!query) {
+      return this.view.symbolState.all;
+    }
+    const lowered = query.toLowerCase();
+    return this.view.symbolState.all.filter((symbol) => symbol.name.toLowerCase().includes(lowered));
   }
 
   completionSymbols(kinds: string[], query = "", limit = 100): SymbolRecord[] {
@@ -938,19 +978,78 @@ export class ServerSnapshot {
   }
 
   renameCandidate(documentUri: string, position: { line: number; character: number }, name: string): RenameCandidate | null {
-    return this.state.renameCandidate(documentUri, position, name);
+    const filePath = uriToFsPath(documentUri);
+    const live = this.view.liveDocuments.get(documentUri);
+    const symbols = (live?.symbols ?? []).filter((symbol) =>
+      symbol.name === name &&
+      symbol.range.start.line === position.line &&
+      symbol.range.start.character === position.character
+    );
+    if (symbols.length > 0) {
+      return { kind: symbols[0].kind, source: symbols[0].source };
+    }
+
+    const baseSymbols = this.symbolsByName(name).filter((symbol) =>
+      symbol.path === filePath &&
+      symbol.range.start.line === position.line &&
+      symbol.range.start.character === position.character
+    );
+    if (baseSymbols.length > 0) {
+      return { kind: baseSymbols[0].kind, source: baseSymbols[0].source };
+    }
+
+    const references = (live?.references ?? []).filter((reference) =>
+      reference.name === name &&
+      reference.range.start.line === position.line &&
+      reference.range.start.character === position.character
+    );
+    if (references.length > 0) {
+      return { kind: referenceKind(references[0]), source: references[0].source };
+    }
+
+    const baseReferences = this.referencesByName(name).filter((reference) =>
+      reference.path === filePath &&
+      reference.range.start.line === position.line &&
+      reference.range.start.character === position.character
+    );
+    if (baseReferences.length > 0) {
+      return { kind: referenceKind(baseReferences[0]), source: baseReferences[0].source };
+    }
+
+    return null;
   }
 
   symbolSnippet(symbol: SymbolRecord): string | undefined {
-    return this.state.symbolSnippet(symbol);
+    const text = this.view.parsedByPath.get(symbol.path)?.text;
+    if (!text) {
+      return undefined;
+    }
+    const lines = text.split(/\r?\n/);
+    const startLine = Math.max(symbol.range.start.line - 1, 0);
+    const endLine = Math.min(symbol.range.end.line + 1, lines.length - 1);
+    return lines.slice(startLine, endLine + 1).join("\n").trim();
   }
 
   localizationText(symbol: SymbolRecord): string | undefined {
-    return this.state.localizationText(symbol);
+    if (symbol.kind !== "localization") {
+      return undefined;
+    }
+    const parsed = this.view.parsedByPath.get(symbol.path);
+    if (!parsed || parsed.kind !== "localization") {
+      return undefined;
+    }
+    return parsed.entries.find((entry) => entry.key === symbol.name)?.value;
   }
 
   localizationLanguage(symbol: SymbolRecord): string | null | undefined {
-    return this.state.localizationLanguage(symbol);
+    if (symbol.kind !== "localization") {
+      return undefined;
+    }
+    const parsed = this.view.parsedByPath.get(symbol.path);
+    if (!parsed || parsed.kind !== "localization") {
+      return undefined;
+    }
+    return parsed.language;
   }
 
   inlayHintCache(uri: string, version: number): InlayHint[] | undefined {
