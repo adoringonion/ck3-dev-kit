@@ -178,8 +178,8 @@ export class ServerState {
       lastIndexError: this.lastIndexError,
       symbolState: cloneDerivedSymbolState(this.getDerivedSymbols()),
       referenceState: cloneDerivedReferenceState(this.getDerivedReferences()),
-      indexedSymbolPositionsByPath: this.indexedSymbolPositionsByPath,
-      indexedReferencePositionsByPath: this.indexedReferencePositionsByPath,
+      indexedSymbolPositionsByPath: cloneNestedSymbolArrayMap(this.indexedSymbolPositionsByPath),
+      indexedReferencePositionsByPath: cloneNestedReferenceArrayMap(this.indexedReferencePositionsByPath),
       liveDocuments,
       parsedByUri,
       parsedByPath,
@@ -1211,6 +1211,22 @@ function cloneReferenceArrayMap(source: Map<string, ReferenceRecord[]>): Map<str
   return cloned;
 }
 
+function cloneNestedSymbolArrayMap(source: Map<string, Map<string, SymbolRecord[]>>): Map<string, Map<string, SymbolRecord[]>> {
+  const cloned = new Map<string, Map<string, SymbolRecord[]>>();
+  for (const [filePath, entries] of source.entries()) {
+    cloned.set(filePath, cloneSymbolArrayMap(entries));
+  }
+  return cloned;
+}
+
+function cloneNestedReferenceArrayMap(source: Map<string, Map<string, ReferenceRecord[]>>): Map<string, Map<string, ReferenceRecord[]>> {
+  const cloned = new Map<string, Map<string, ReferenceRecord[]>>();
+  for (const [filePath, entries] of source.entries()) {
+    cloned.set(filePath, cloneReferenceArrayMap(entries));
+  }
+  return cloned;
+}
+
 function updateDerivedSymbolsForLiveChange(
   state: DerivedSymbolState,
   previous: LiveDocumentRecord | undefined,
@@ -1332,11 +1348,15 @@ function buildDocumentDependencies(
   symbols: SymbolRecord[],
   references: ReferenceRecord[],
 ): { referencedNames: string[]; diagnosticTags: string[] } {
+  const filePath = documentUri === "<in-memory>" ? null : uriToFsPath(documentUri);
   const names = new Set<string>();
   const tags = new Set<string>([
     "diagnostics",
     `diagnostics:${documentUri}`,
   ]);
+  if (filePath) {
+    tags.add(`path:${filePath}`);
+  }
 
   for (const symbol of symbols) {
     names.add(symbol.name);

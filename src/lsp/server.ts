@@ -65,7 +65,7 @@ import {
   IndexStatusPayload,
   REBUILD_INDEX_NOTIFICATION,
 } from "./protocol";
-import { cancellationFromAbortSignal, RequestCancelledError, RequestContext } from "./requestContext";
+import { cancellationFromAbortSignal, CancellationLike, RequestCancelledError, RequestContext } from "./requestContext";
 import { ServerConfig, ServerSnapshot, ServerState, SourceKind } from "./serverState";
 
 const connection = createConnection();
@@ -79,6 +79,7 @@ const WORKSPACE_DIAGNOSTIC_BATCH_INTERVAL_MS = 250;
 const activeDocumentWorkers = new Map<string, { version: number; worker: Worker }>();
 const cancelledDocumentWorkers = new WeakSet<Worker>();
 const documentAnalysisControllers = new Map<string, AbortController>();
+const documentDiagnosticControllers = new Map<string, AbortController>();
 let workspaceDiagnosticsController: AbortController | null = null;
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
@@ -297,13 +298,13 @@ connection.onDocumentSymbol(({ textDocument }) => {
     }));
 });
 
-connection.onWorkspaceSymbol(({ query }: WorkspaceSymbolParams): SymbolInformation[] => {
-  const context = new RequestContext({ label: "workspaceSymbol" });
+connection.onWorkspaceSymbol(({ query }: WorkspaceSymbolParams, token): SymbolInformation[] => {
+  const context = new RequestContext({ label: "workspaceSymbol", token });
   return state.snapshot().workspaceSymbols(query, context)
     .map((symbol) => toWorkspaceSymbol(symbol) as SymbolInformation);
 });
 
-connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams) => {
+connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams, token) => {
   const document = documents.get(textDocument.uri);
   if (!document) {
     return null;
@@ -314,7 +315,7 @@ connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams) => 
   }
   const name = document.getText(wordRange);
   const snapshot = state.snapshot();
-  const context = new RequestContext({ label: "prepareRename" });
+  const context = new RequestContext({ label: "prepareRename", token });
   const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name, context);
   const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name, context));
   if (!target) {
@@ -326,7 +327,7 @@ connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams) => 
   };
 });
 
-connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): WorkspaceEdit | null => {
+connection.onRenameRequest(({ textDocument, position, newName }: RenameParams, token): WorkspaceEdit | null => {
   const document = documents.get(textDocument.uri);
   if (!document) {
     return null;
@@ -337,7 +338,7 @@ connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): 
   }
   const name = document.getText(wordRange);
   const snapshot = state.snapshot();
-  const context = new RequestContext({ label: "rename" });
+  const context = new RequestContext({ label: "rename", token });
   const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name, context);
   const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name, context));
   if (!target) {
@@ -496,6 +497,7 @@ documents.onDidChangeContent((event) => {
 documents.onDidClose((event) => {
   cancelDocumentWorker(event.document.uri);
   cancelDocumentAnalysisContext(event.document.uri);
+  cancelDocumentDiagnosticsContext(event.document.uri);
   state.cancelDocumentAnalysis(event.document.uri);
   state.cancelDocumentDiagnostics(event.document.uri);
   clearHoverCacheForUri(event.document.uri);
@@ -546,6 +548,7 @@ async function rebuildIndex(reason: string): Promise<void> {
     state.markIndexRebuilding();
     cancelAllDocumentWorkers();
     cancelAllDocumentAnalysisContexts();
+    cancelAllDocumentDiagnosticsContexts();
     cancelWorkspaceDiagnosticsContext();
     try {
       context.checkpoint("Collecting workspace files");
@@ -584,9 +587,10 @@ async function rebuildIndex(reason: string): Promise<void> {
   await indexBuildPromise;
 }
 
-function publishDiagnostics(document: TextDocument): void {
-  const context = new RequestContext({ label: "publishDiagnostics" });
+function publishDiagnostics(document: TextDocument, token?: CancellationLike): void {
+  const context = new RequestContext({ label: "publishDiagnostics", token });
   const diagnostics = timeRequest<Diagnostic[]>("publishDiagnostics", undefined, () => state.collectDocumentDiagnostics(document, context));
+  context.throwIfCancelled();
   connection.sendDiagnostics({
     uri: document.uri,
     diagnostics,
@@ -594,8 +598,15 @@ function publishDiagnostics(document: TextDocument): void {
 }
 
 function scheduleDiagnostics(document: TextDocument, delayMs: number): void {
+  cancelDocumentDiagnosticsContext(document.uri);
+  const controller = new AbortController();
+  documentDiagnosticControllers.set(document.uri, controller);
   state.scheduleDocumentDiagnostics(document.uri, delayMs, () => {
-    publishDiagnostics(document);
+    const latestController = documentDiagnosticControllers.get(document.uri);
+    if (!latestController || latestController !== controller || controller.signal.aborted) {
+      return;
+    }
+    publishDiagnostics(document, cancellationFromAbortSignal(controller.signal));
   });
 }
 
@@ -1038,6 +1049,22 @@ function cancelDocumentAnalysisContext(uri: string): void {
 function cancelAllDocumentAnalysisContexts(): void {
   for (const [uri, controller] of documentAnalysisControllers.entries()) {
     documentAnalysisControllers.delete(uri);
+    controller.abort();
+  }
+}
+
+function cancelDocumentDiagnosticsContext(uri: string): void {
+  const controller = documentDiagnosticControllers.get(uri);
+  if (!controller) {
+    return;
+  }
+  documentDiagnosticControllers.delete(uri);
+  controller.abort();
+}
+
+function cancelAllDocumentDiagnosticsContexts(): void {
+  for (const [uri, controller] of documentDiagnosticControllers.entries()) {
+    documentDiagnosticControllers.delete(uri);
     controller.abort();
   }
 }
