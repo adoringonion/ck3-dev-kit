@@ -1,21 +1,41 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
+import { LanguageClient } from "vscode-languageclient/node";
 import { analyzeErrorLogFile } from "./core/errorLog";
 import { IndexStore } from "./extension/indexStore";
-import { registerProviders } from "./extension/providers";
 import { writeWorkspaceAssociations } from "./extension/workspaceSettings";
 import { readConfig } from "./extension/config";
+import { createLanguageClient } from "./lsp/client";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const store = new IndexStore();
   const output = vscode.window.createOutputChannel("CK3 Mod DevKit");
   let rebuildTimer: NodeJS.Timeout | undefined;
+  let languageClient: LanguageClient | undefined;
   context.subscriptions.push(output);
+
+  const startLanguageServer = async () => {
+    const nextClient = createLanguageClient(context, readConfig(), output);
+    context.subscriptions.push(nextClient);
+    await nextClient.start();
+    languageClient = nextClient;
+  };
+
+  const restartLanguageServer = async () => {
+    if (languageClient) {
+      await languageClient.stop();
+      languageClient = undefined;
+    }
+    await startLanguageServer();
+  };
 
   const rebuildIndex = async (reason: string, notify = false) => {
     try {
       output.appendLine(`[${new Date().toISOString()}] Rebuilding index: ${reason}`);
       await store.rebuild();
+      if (languageClient) {
+        await languageClient.sendNotification("ck3/rebuildIndex");
+      }
       for (const document of vscode.workspace.textDocuments) {
         store.syncTextDocument(document);
       }
@@ -41,8 +61,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, delayMs);
   };
 
-  registerProviders(context, store);
   void promptForWorkspaceAssociations();
+  await startLanguageServer();
 
   context.subscriptions.push(
     vscode.commands.registerCommand("ck3ModDevkit.associateWorkspace", async () => {
@@ -91,6 +111,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.onDidChangeConfiguration(async (event) => {
       if (event.affectsConfiguration("ck3ModDevkit")) {
         scheduleRebuild("configuration change");
+        await restartLanguageServer();
       }
     })
   );

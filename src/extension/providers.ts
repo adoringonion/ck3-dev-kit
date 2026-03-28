@@ -12,8 +12,15 @@ const SELECTOR: vscode.DocumentSelector = [
   { scheme: "file", pattern: "**/*.{txt,gui,info,asset,yml}" },
 ];
 
-export function registerProviders(context: vscode.ExtensionContext, store: IndexStore): void {
-  context.subscriptions.push(
+interface ProviderOptions {
+  hover?: boolean;
+  diagnostics?: boolean;
+}
+
+export function registerProviders(context: vscode.ExtensionContext, store: IndexStore, options: ProviderOptions = {}): void {
+  const enableHover = options.hover ?? true;
+  const enableDiagnostics = options.diagnostics ?? true;
+  const registrations: vscode.Disposable[] = [
     vscode.languages.registerDefinitionProvider(SELECTOR, {
       async provideDefinition(document, position) {
         const word = findReferenceWord(document, position);
@@ -29,33 +36,6 @@ export function registerProviders(context: vscode.ExtensionContext, store: Index
           return undefined;
         }
         return relevant.map(toLocation);
-      },
-    }),
-    vscode.languages.registerHoverProvider(SELECTOR, {
-      async provideHover(document, position) {
-        const word = findReferenceWord(document, position);
-        if (!word) {
-          return undefined;
-        }
-        const parsed = parseLiveDocument(document);
-        const name = document.getText(word);
-        const syntaxHelp = getScriptSyntaxHelp(name, parsed ? syntaxHelpContextAt(parsed, word) : undefined);
-        if (syntaxHelp) {
-          const markdown = new vscode.MarkdownString(
-            `**${syntaxHelp.id}**\n\n${syntaxHelp.title}\n\n${syntaxHelp.summary}\n\n${syntaxHelp.details.join("\n\n")}`
-          );
-          return new vscode.Hover(markdown, word);
-        }
-        const symbols = await store.symbolsByName(name);
-        const target = symbols.find((item) => item.kind !== "localization-reference");
-        if (!target) {
-          return undefined;
-        }
-        const referenceCount = (await store.referencesByName(name)).length;
-        const markdown = new vscode.MarkdownString(
-          `**${target.name}**\n\nType: \`${target.kind}\`\n\nSource: \`${target.source}\`\n\nReferences: \`${referenceCount}\`\n\nPath: \`${target.path}\``
-        );
-        return new vscode.Hover(markdown, word);
       },
     }),
     vscode.languages.registerReferenceProvider(SELECTOR, {
@@ -146,8 +126,43 @@ export function registerProviders(context: vscode.ExtensionContext, store: Index
         return symbol;
       },
     })
-  );
+  ];
 
+  if (enableHover) {
+    registrations.push(vscode.languages.registerHoverProvider(SELECTOR, {
+      async provideHover(document, position) {
+        const word = findReferenceWord(document, position);
+        if (!word) {
+          return undefined;
+        }
+        const parsed = parseLiveDocument(document);
+        const name = document.getText(word);
+        const syntaxHelp = getScriptSyntaxHelp(name, parsed ? syntaxHelpContextAt(parsed, word) : undefined);
+        if (syntaxHelp) {
+          const markdown = new vscode.MarkdownString(
+            `**${syntaxHelp.id}**\n\n${syntaxHelp.title}\n\n${syntaxHelp.summary}\n\n${syntaxHelp.details.join("\n\n")}`
+          );
+          return new vscode.Hover(markdown, word);
+        }
+        const symbols = await store.symbolsByName(name);
+        const target = symbols.find((item) => item.kind !== "localization-reference");
+        if (!target) {
+          return undefined;
+        }
+        const referenceCount = (await store.referencesByName(name)).length;
+        const markdown = new vscode.MarkdownString(
+          `**${target.name}**\n\nType: \`${target.kind}\`\n\nSource: \`${target.source}\`\n\nReferences: \`${referenceCount}\`\n\nPath: \`${target.path}\``
+        );
+        return new vscode.Hover(markdown, word);
+      },
+    }));
+  }
+
+  context.subscriptions.push(...registrations);
+
+  if (!enableDiagnostics) {
+    return;
+  }
   const diagnostics = vscode.languages.createDiagnosticCollection("ck3ModDevkit");
   context.subscriptions.push(diagnostics);
 
