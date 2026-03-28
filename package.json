@@ -133,10 +133,11 @@
   },
   "scripts": {
     "build": "node ./node_modules/typescript/bin/tsc -p .",
+    "bundle": "node ./scripts/bundle.mjs",
     "watch": "node ./node_modules/typescript/bin/tsc -w -p .",
     "check": "node ./node_modules/typescript/bin/tsc -p . --noEmit",
     "test": "npm run build && node --test test/core.test.js && node --test test/cli.test.js && node --test test/lsp.test.js",
-    "package:vsix": "npm run build && node ./node_modules/@vscode/vsce/vsce package",
+    "package:vsix": "npm run build && npm run bundle && node ./node_modules/@vscode/vsce/vsce package",
     "index": "node dist/cli.js",
     "find-symbol": "node dist/find-symbol.js",
     "find-references": "node dist/find-references.js",
@@ -157,6 +158,7 @@
     "@types/node": "^18.19.24",
     "@types/vscode": "^1.86.0",
     "@vscode/vsce": "^2.15.0",
+    "esbuild": "^0.25.12",
     "typescript": "^5.4.5"
   }
 }

@@ -3,6 +3,8 @@ test/**
 .vscode/**
 tsconfig.json
 package-lock.json
+scripts/**
+node_modules/**
 *.log
 .cache/**
 *.vsix

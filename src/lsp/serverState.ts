@@ -22,6 +22,11 @@ export interface LiveDocumentRecord {
   source: SourceKind;
 }
 
+export interface RenameCandidate {
+  kind: string;
+  source: SourceKind;
+}
+
 interface DiagnosticCacheEntry {
   version: number;
   indexRevision: number;
@@ -327,6 +332,129 @@ export class ServerState {
     return matches.slice(0, limit);
   }
 
+  preferredLocalizationFile(): string | null {
+    for (const root of this.config.modRoots) {
+      const folder = path.join(root, "localization");
+      if (fsExists(folder)) {
+        return path.join(folder, "english", "zz_generated_l_english.yml");
+      }
+    }
+    return null;
+  }
+
+  preferredScriptDefinitionFile(kind: "scripted_effect" | "scripted_trigger" | "script_value"): string | null {
+    const relativeFolder =
+      kind === "scripted_effect"
+        ? path.join("common", "scripted_effects")
+        : kind === "scripted_trigger"
+          ? path.join("common", "scripted_triggers")
+          : path.join("common", "script_values");
+    const fallbackName =
+      kind === "scripted_effect"
+        ? "zz_generated_effects.txt"
+        : kind === "scripted_trigger"
+          ? "zz_generated_triggers.txt"
+          : "zz_generated_values.txt";
+
+    for (const root of this.config.modRoots) {
+      const folder = path.join(root, relativeFolder);
+      const parent = path.dirname(folder);
+      if (!fsExists(parent) && !fsExists(folder)) {
+        continue;
+      }
+      return path.join(folder, fallbackName);
+    }
+    return null;
+  }
+
+  preferredEventFile(eventId: string): string | null {
+    const namespace = eventId.includes(".") ? eventId.split(".")[0] : "generated";
+    for (const root of this.config.modRoots) {
+      const folder = path.join(root, "events");
+      const parent = path.dirname(folder);
+      if (!fsExists(parent) && !fsExists(folder)) {
+        continue;
+      }
+      return path.join(folder, `${namespace}_events.txt`);
+    }
+    return null;
+  }
+
+  renameCandidate(documentUri: string, position: { line: number; character: number }, name: string): RenameCandidate | null {
+    const filePath = uriToFsPath(documentUri);
+    const live = this.getLiveDocument(documentUri);
+    const symbols = (live?.symbols ?? []).filter((symbol) =>
+      symbol.name === name &&
+      symbol.range.start.line === position.line &&
+      symbol.range.start.character === position.character
+    );
+    if (symbols.length > 0) {
+      return { kind: symbols[0].kind, source: symbols[0].source };
+    }
+
+    const baseSymbols = (this.index.symbols.get(name) ?? []).filter((symbol) =>
+      symbol.path === filePath &&
+      symbol.range.start.line === position.line &&
+      symbol.range.start.character === position.character
+    );
+    if (baseSymbols.length > 0) {
+      return { kind: baseSymbols[0].kind, source: baseSymbols[0].source };
+    }
+
+    const references = (live?.references ?? []).filter((reference) =>
+      reference.name === name &&
+      reference.range.start.line === position.line &&
+      reference.range.start.character === position.character
+    );
+    if (references.length > 0) {
+      return { kind: referenceKind(references[0]), source: references[0].source };
+    }
+
+    const baseReferences = (this.index.references.get(name) ?? []).filter((reference) =>
+      reference.path === filePath &&
+      reference.range.start.line === position.line &&
+      reference.range.start.character === position.character
+    );
+    if (baseReferences.length > 0) {
+      return { kind: referenceKind(baseReferences[0]), source: baseReferences[0].source };
+    }
+
+    return null;
+  }
+
+  symbolSnippet(symbol: SymbolRecord): string | undefined {
+    const text = this.getParsedDocumentForPath(symbol.path)?.text;
+    if (!text) {
+      return undefined;
+    }
+    const lines = text.split(/\r?\n/);
+    const startLine = Math.max(symbol.range.start.line - 1, 0);
+    const endLine = Math.min(symbol.range.end.line + 1, lines.length - 1);
+    return lines.slice(startLine, endLine + 1).join("\n").trim();
+  }
+
+  localizationText(symbol: SymbolRecord): string | undefined {
+    if (symbol.kind !== "localization") {
+      return undefined;
+    }
+    const parsed = this.getParsedDocumentForPath(symbol.path);
+    if (!parsed || parsed.kind !== "localization") {
+      return undefined;
+    }
+    return parsed.entries.find((entry) => entry.key === symbol.name)?.value;
+  }
+
+  localizationLanguage(symbol: SymbolRecord): string | null | undefined {
+    if (symbol.kind !== "localization") {
+      return undefined;
+    }
+    const parsed = this.getParsedDocumentForPath(symbol.path);
+    if (!parsed || parsed.kind !== "localization") {
+      return undefined;
+    }
+    return parsed.language;
+  }
+
   scheduleDocumentDiagnostics(uri: string, delayMs: number, publish: () => void): void {
     this.cancelDocumentDiagnostics(uri);
     const timer = setTimeout(() => {
@@ -464,4 +592,16 @@ function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: strin
     }
     return symbolKind === kind;
   });
+}
+
+function referenceKind(reference: ReferenceRecord): string {
+  return reference.kind;
+}
+
+function fsExists(filePath: string): boolean {
+  try {
+    return require("fs").existsSync(filePath);
+  } catch {
+    return false;
+  }
 }

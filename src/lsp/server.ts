@@ -164,9 +164,9 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
         target,
         referenceCount,
         definitions.length,
-        symbolSnippet(target),
-        localizationText(target),
-        localizationLanguage(target)
+        state.symbolSnippet(target),
+        state.localizationText(target),
+        state.localizationLanguage(target)
       ),
     },
     range: wordRange,
@@ -328,7 +328,7 @@ connection.onCodeAction((params): CodeAction[] => {
       const action = createMissingLocalizationCodeAction(
         diagnostic,
         unresolvedLocalization[1],
-        preferredLocalizationFile()
+        state.preferredLocalizationFile()
       );
       if (action) {
         actions.push(action);
@@ -348,7 +348,7 @@ connection.onCodeAction((params): CodeAction[] => {
       const action = createMissingEventCodeAction(
         diagnostic,
         unresolvedEvent[1],
-        preferredEventFile(unresolvedEvent[1])
+        state.preferredEventFile(unresolvedEvent[1])
       );
       if (action) {
         actions.push(action);
@@ -365,7 +365,7 @@ connection.onCodeAction((params): CodeAction[] => {
         diagnostic,
         unresolvedScriptDefinition[2],
         unresolvedScriptDefinition[1] as "scripted_effect" | "scripted_trigger" | "script_value",
-        preferredScriptDefinitionFile(unresolvedScriptDefinition[1] as "scripted_effect" | "scripted_trigger" | "script_value")
+        state.preferredScriptDefinitionFile(unresolvedScriptDefinition[1] as "scripted_effect" | "scripted_trigger" | "script_value")
       );
       if (action) {
         actions.push(action);
@@ -529,105 +529,14 @@ function completionSymbols(kinds: string[], query = "", limit = 100): SymbolReco
 }
 
 function targetRenameCandidate(documentUri: string, range: Range, name: string): { kind: string; source: SourceKind } | null {
-  const filePath = uriToFsPath(documentUri);
-  const live = state.getLiveDocument(documentUri);
-  const symbols = (live?.symbols ?? []).filter((symbol) =>
-    symbol.name === name &&
-    symbol.range.start.line === range.start.line &&
-    symbol.range.start.character === range.start.character
-  );
-  if (symbols.length > 0) {
-    return {
-      kind: normalizeRenameKind(symbols[0].kind),
-      source: symbols[0].source,
-    };
+  const candidate = state.renameCandidate(documentUri, range.start, name);
+  if (!candidate) {
+    return null;
   }
-
-  const baseSymbols = (state.getIndex().symbols.get(name) ?? []).filter((symbol) =>
-    symbol.path === filePath &&
-    symbol.range.start.line === range.start.line &&
-    symbol.range.start.character === range.start.character
-  );
-  if (baseSymbols.length > 0) {
-    return {
-      kind: normalizeRenameKind(baseSymbols[0].kind),
-      source: baseSymbols[0].source,
-    };
-  }
-
-  const references = (live?.references ?? []).filter((reference) =>
-    reference.name === name &&
-    reference.range.start.line === range.start.line &&
-    reference.range.start.character === range.start.character
-  );
-  if (references.length > 0) {
-    return {
-      kind: normalizeRenameKind(references[0].kind),
-      source: references[0].source,
-    };
-  }
-
-  const baseReferences = (state.getIndex().references.get(name) ?? []).filter((reference) =>
-    reference.path === filePath &&
-    reference.range.start.line === range.start.line &&
-    reference.range.start.character === range.start.character
-  );
-  if (baseReferences.length > 0) {
-    return {
-      kind: normalizeRenameKind(baseReferences[0].kind),
-      source: baseReferences[0].source,
-    };
-  }
-
-  return null;
-}
-
-function preferredLocalizationFile(): string | null {
-  for (const root of state.getConfig().modRoots) {
-    const folder = path.join(root, "localization");
-    if (fsExists(folder)) {
-      return path.join(folder, "english", "zz_generated_l_english.yml");
-    }
-  }
-  return null;
-}
-
-function preferredScriptDefinitionFile(kind: "scripted_effect" | "scripted_trigger" | "script_value"): string | null {
-  const relativeFolder =
-    kind === "scripted_effect"
-      ? path.join("common", "scripted_effects")
-      : kind === "scripted_trigger"
-        ? path.join("common", "scripted_triggers")
-        : path.join("common", "script_values");
-  const fallbackName =
-    kind === "scripted_effect"
-      ? "zz_generated_effects.txt"
-      : kind === "scripted_trigger"
-        ? "zz_generated_triggers.txt"
-        : "zz_generated_values.txt";
-
-  for (const root of state.getConfig().modRoots) {
-    const folder = path.join(root, relativeFolder);
-    const parent = path.dirname(folder);
-    if (!fsExists(parent) && !fsExists(folder)) {
-      continue;
-    }
-    return path.join(folder, fallbackName);
-  }
-  return null;
-}
-
-function preferredEventFile(eventId: string): string | null {
-  const namespace = eventId.includes(".") ? eventId.split(".")[0] : "generated";
-  for (const root of state.getConfig().modRoots) {
-    const folder = path.join(root, "events");
-    const parent = path.dirname(folder);
-    if (!fsExists(parent) && !fsExists(folder)) {
-      continue;
-    }
-    return path.join(folder, `${namespace}_events.txt`);
-  }
-  return null;
+  return {
+    kind: normalizeRenameKind(candidate.kind),
+    source: candidate.source,
+  };
 }
 
 function syntaxHelpContextAt(parsed: ParsedDocument, range: Range): SyntaxHelpContext | undefined {
@@ -712,18 +621,6 @@ function toReferenceLocation(reference: ReferenceRecord): Location {
   };
 }
 
-function symbolSnippet(symbol: SymbolRecord): string | undefined {
-  const text = state.getParsedDocumentForPath(symbol.path)?.text;
-  if (!text) {
-    return undefined;
-  }
-
-  const lines = text.split(/\r?\n/);
-  const startLine = Math.max(symbol.range.start.line - 1, 0);
-  const endLine = Math.min(symbol.range.end.line + 1, lines.length - 1);
-  return lines.slice(startLine, endLine + 1).join("\n").trim();
-}
-
 function indexingHover(message: string): Hover {
   return {
     contents: {
@@ -731,36 +628,6 @@ function indexingHover(message: string): Hover {
       value: message,
     },
   };
-}
-
-function localizationText(symbol: SymbolRecord): string | undefined {
-  if (symbol.kind !== "localization") {
-    return undefined;
-  }
-  const parsed = parsedDocumentForSymbol(symbol);
-  if (!parsed || parsed.kind !== "localization") {
-    return undefined;
-  }
-  return parsed.entries.find((entry) => entry.key === symbol.name)?.value;
-}
-
-function localizationLanguage(symbol: SymbolRecord): string | null | undefined {
-  if (symbol.kind !== "localization") {
-    return undefined;
-  }
-  const parsed = parsedDocumentForSymbol(symbol);
-  if (!parsed || parsed.kind !== "localization") {
-    return undefined;
-  }
-  return parsed.language;
-}
-
-function parsedDocumentForSymbol(symbol: SymbolRecord): ParsedDocument | undefined {
-  const live = parsedDocumentForUri(pathToFileURL(symbol.path).toString());
-  if (live) {
-    return live;
-  }
-  return state.getParsedDocumentForPath(symbol.path);
 }
 
 function parsedDocumentForUri(uri: string): ParsedDocument | undefined {
@@ -848,14 +715,6 @@ function uriToFsPath(uri: string): string {
 
 function looksLikeEventId(name: string): boolean {
   return /^[a-zA-Z0-9_]+\.\d+$/.test(name);
-}
-
-function fsExists(filePath: string): boolean {
-  try {
-    return require("fs").existsSync(filePath);
-  } catch {
-    return false;
-  }
 }
 
 function safeStat(filePath: string) {
