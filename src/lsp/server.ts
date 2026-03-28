@@ -6,9 +6,6 @@ import {
   Definition,
   Diagnostic,
   DiagnosticSeverity,
-  DocumentDiagnosticReport,
-  DocumentDiagnosticReportKind,
-  FullDocumentDiagnosticReport,
   Hover,
   InitializeParams,
   InitializeResult,
@@ -24,22 +21,20 @@ import {
   SymbolInformation,
   TextDocumentSyncKind,
   TextDocuments,
-  WorkspaceDiagnosticReport,
   WorkspaceSymbolParams,
   WorkspaceEdit,
 } from "vscode-languageserver/node";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import * as path from "path";
 import { pathToFileURL } from "url";
+import { Worker } from "worker_threads";
 import { createDocumentIndexRecord, WorkspaceIndex } from "../core/indexer";
 import { validateParsedDocumentAgainstIndex, validateReferences } from "../core/references";
 import { parseDocumentText } from "../core/document";
 import { LocalizationDocument, ParsedDocument, AssignmentNode, ReferenceRecord, SymbolRecord } from "../core/types";
-import { buildCachedWorkspaceIndex } from "../cli-shared";
 import { getScriptSyntaxHelp, SyntaxHelpContext } from "../extension/dynamicReferenceHelp";
 import { inferCompletionContext } from "../extension/completion";
 import {
-  buildDocumentDiagnosticReport,
   buildHoverMarkdown,
   buildInlayHints,
   buildRenameWorkspaceEdit,
@@ -79,6 +74,14 @@ interface LiveDocumentRecord {
   source: SourceKind;
 }
 
+type IndexPhase = "started" | "completed" | "failed" | "busy";
+
+interface IndexStatusPayload {
+  phase: IndexPhase;
+  reason: string;
+  message?: string;
+}
+
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 
@@ -94,10 +97,12 @@ let index: WorkspaceIndex = {
   files: [],
 };
 const liveDocuments = new Map<string, LiveDocumentRecord>();
+let indexBuildPromise: Promise<void> | null = null;
+let indexReady = false;
+let lastIndexError: string | null = null;
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   config = normalizeConfig(params.initializationOptions);
-  rebuildIndex();
   return {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Incremental,
@@ -112,7 +117,6 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       renameProvider: {
         prepareProvider: true,
       },
-      codeActionProvider: true,
       inlayHintProvider: true,
       semanticTokensProvider: {
         legend: {
@@ -121,25 +125,29 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
         },
         full: true,
       },
-      diagnosticProvider: {
-        interFileDependencies: false,
-        workspaceDiagnostics: true,
-      },
     },
   };
 });
 
 connection.onInitialized(() => {
+  void rebuildIndex("startup");
   for (const document of documents.all()) {
     syncDocument(document);
     publishDiagnostics(document);
   }
 });
 
-connection.onHover(({ textDocument, position }): Hover | null => {
+connection.onHover(({ textDocument, position }): Hover | null => timeRequest("hover", () => {
   const document = documents.get(textDocument.uri);
   if (!document) {
     return null;
+  }
+
+  if (indexBuildPromise) {
+    return indexingHover("CK3 Mod DevKit is building the symbol index. Hover, definition, and references will fill in when indexing completes.");
+  }
+  if (!indexReady && lastIndexError) {
+    return indexingHover(`CK3 Mod DevKit failed to build its symbol index.\n\n${lastIndexError}`);
   }
 
   const wordRange = findWordRange(document, position);
@@ -147,7 +155,8 @@ connection.onHover(({ textDocument, position }): Hover | null => {
     return null;
   }
 
-  const parsed = parseDocumentText(uriToFsPath(document.uri), document.getText());
+  const parsed = parsedDocumentForUri(document.uri)
+    ?? parseDocumentText(uriToFsPath(document.uri), document.getText());
   const name = document.getText(wordRange);
   const syntaxHelp = getScriptSyntaxHelp(name, parsed.kind === "script" ? syntaxHelpContextAt(parsed, wordRange) : undefined);
   if (syntaxHelp) {
@@ -183,11 +192,11 @@ connection.onHover(({ textDocument, position }): Hover | null => {
     },
     range: wordRange,
   };
-});
+}));
 
-connection.onDefinition(({ textDocument, position }): Definition | null => {
+connection.onDefinition(({ textDocument, position }): Definition | null => timeRequest("definition", () => {
   const document = documents.get(textDocument.uri);
-  if (!document) {
+  if (!document || indexBuildPromise || !indexReady) {
     return null;
   }
   const wordRange = findWordRange(document, position);
@@ -203,11 +212,11 @@ connection.onDefinition(({ textDocument, position }): Definition | null => {
     return null;
   }
   return relevant.map(toLocation);
-});
+}));
 
-connection.onReferences(({ textDocument, position }: ReferenceParams): Location[] | null => {
+connection.onReferences(({ textDocument, position }: ReferenceParams): Location[] | null => timeRequest("references", () => {
   const document = documents.get(textDocument.uri);
-  if (!document) {
+  if (!document || indexBuildPromise || !indexReady) {
     return null;
   }
   const wordRange = findWordRange(document, position);
@@ -216,9 +225,9 @@ connection.onReferences(({ textDocument, position }: ReferenceParams): Location[
   }
   const name = document.getText(wordRange);
   return referencesByName(name).map(toReferenceLocation);
-});
+}));
 
-connection.onCompletion(({ textDocument, position }: CompletionParams): CompletionItem[] | null => {
+connection.onCompletion(({ textDocument, position }: CompletionParams): CompletionItem[] | null => timeRequest("completion", () => {
   const document = documents.get(textDocument.uri);
   if (!document) {
     return null;
@@ -247,7 +256,7 @@ connection.onCompletion(({ textDocument, position }: CompletionParams): Completi
     },
     sortText: `${symbol.source === "mod" ? "0" : "1"}-${symbol.name}`,
   }));
-});
+}));
 
 connection.onDocumentSymbol(({ textDocument }) => {
   const document = documents.get(textDocument.uri);
@@ -404,38 +413,8 @@ connection.languages.semanticTokens.on(({ textDocument }): SemanticTokens => {
   return buildSemanticTokens(parsed);
 });
 
-connection.languages.diagnostics.on((params): DocumentDiagnosticReport => {
-  const document = documents.get(params.textDocument.uri);
-  if (!document) {
-    return {
-      kind: DocumentDiagnosticReportKind.Full,
-      items: [],
-    };
-  }
-  return buildDocumentDiagnosticReport(collectDocumentDiagnostics(document));
-});
-
-connection.languages.diagnostics.onWorkspace((): WorkspaceDiagnosticReport => {
-  const items = Array.from(index.documents.entries())
-    .map(([filePath, parsed]) => {
-      const diagnostics = collectValidationDiagnostics(parsed, filePath);
-      return {
-        kind: DocumentDiagnosticReportKind.Full,
-        uri: pathToFileURL(filePath).toString(),
-        version: null,
-        items: diagnostics,
-      } as FullDocumentDiagnosticReport & { uri: string; version: null };
-    })
-    .filter((entry) => entry.items.length > 0);
-  return { items };
-});
-
 connection.onNotification("ck3/rebuildIndex", () => {
-  rebuildIndex();
-  for (const document of documents.all()) {
-    syncDocument(document);
-    publishDiagnostics(document);
-  }
+  void rebuildIndex("manual command");
 });
 
 documents.onDidOpen((event) => {
@@ -468,8 +447,36 @@ function normalizeConfig(value: unknown): ServerConfig {
   };
 }
 
-function rebuildIndex(): void {
-  index = buildCachedWorkspaceIndex(config);
+async function rebuildIndex(reason: string): Promise<void> {
+  if (indexBuildPromise) {
+    sendIndexStatus({ phase: "busy", reason });
+    await indexBuildPromise;
+    return;
+  }
+
+  indexBuildPromise = (async () => {
+    sendIndexStatus({ phase: "started", reason });
+    lastIndexError = null;
+    try {
+      index = await buildIndexInWorker(config);
+      indexReady = true;
+      sendIndexStatus({ phase: "completed", reason });
+    } catch (error) {
+      indexReady = false;
+      lastIndexError = error instanceof Error ? error.message : String(error);
+      sendIndexStatus({ phase: "failed", reason, message: lastIndexError });
+      throw error;
+    } finally {
+      indexBuildPromise = null;
+    }
+
+    for (const document of documents.all()) {
+      syncDocument(document);
+      publishDiagnostics(document);
+    }
+  })();
+
+  await indexBuildPromise;
 }
 
 function syncDocument(document: TextDocument): void {
@@ -486,9 +493,10 @@ function syncDocument(document: TextDocument): void {
 }
 
 function publishDiagnostics(document: TextDocument): void {
+  const diagnostics = timeRequest("publishDiagnostics", () => collectDocumentDiagnostics(document));
   connection.sendDiagnostics({
     uri: document.uri,
-    diagnostics: collectDocumentDiagnostics(document),
+    diagnostics,
   });
 }
 
@@ -699,12 +707,8 @@ function targetRenameCandidate(documentUri: string, range: Range, name: string):
 function preferredLocalizationFile(): string | null {
   for (const root of config.modRoots) {
     const folder = path.join(root, "localization");
-    if (!fsExists(folder)) {
-      continue;
-    }
-    const files = walkFiles(folder).filter((file) => file.toLowerCase().endsWith(".yml"));
-    if (files.length > 0) {
-      return files.sort()[0];
+    if (fsExists(folder)) {
+      return path.join(folder, "english", "zz_generated_l_english.yml");
     }
   }
   return null;
@@ -726,16 +730,9 @@ function preferredScriptDefinitionFile(kind: "scripted_effect" | "scripted_trigg
 
   for (const root of config.modRoots) {
     const folder = path.join(root, relativeFolder);
-    if (!fsExists(folder)) {
-      const parent = path.dirname(folder);
-      if (!fsExists(parent)) {
-        continue;
-      }
-      return path.join(folder, fallbackName);
-    }
-    const files = walkFiles(folder).filter((file) => file.toLowerCase().endsWith(".txt"));
-    if (files.length > 0) {
-      return files.sort()[0];
+    const parent = path.dirname(folder);
+    if (!fsExists(parent) && !fsExists(folder)) {
+      continue;
     }
     return path.join(folder, fallbackName);
   }
@@ -746,41 +743,13 @@ function preferredEventFile(eventId: string): string | null {
   const namespace = eventId.includes(".") ? eventId.split(".")[0] : "generated";
   for (const root of config.modRoots) {
     const folder = path.join(root, "events");
-    if (!fsExists(folder)) {
-      const parent = path.dirname(folder);
-      if (!fsExists(parent)) {
-        continue;
-      }
-      return path.join(folder, `${namespace}_events.txt`);
-    }
-    const files = walkFiles(folder).filter((file) => file.toLowerCase().endsWith(".txt"));
-    const namespaceMatch = files.find((file) => path.basename(file).toLowerCase().includes(namespace.toLowerCase()));
-    if (namespaceMatch) {
-      return namespaceMatch;
+    const parent = path.dirname(folder);
+    if (!fsExists(parent) && !fsExists(folder)) {
+      continue;
     }
     return path.join(folder, `${namespace}_events.txt`);
   }
   return null;
-}
-
-function walkFiles(root: string): string[] {
-  const results: string[] = [];
-  const queue = [root];
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    const stat = safeStat(current);
-    if (!stat) {
-      continue;
-    }
-    if (stat.isDirectory()) {
-      for (const child of safeReadDir(current)) {
-        queue.push(path.join(current, child));
-      }
-      continue;
-    }
-    results.push(current);
-  }
-  return results;
 }
 
 function syntaxHelpContextAt(parsed: ParsedDocument, range: Range): SyntaxHelpContext | undefined {
@@ -878,6 +847,15 @@ function symbolSnippet(symbol: SymbolRecord): string | undefined {
   return lines.slice(startLine, endLine + 1).join("\n").trim();
 }
 
+function indexingHover(message: string): Hover {
+  return {
+    contents: {
+      kind: MarkupKind.Markdown,
+      value: message,
+    },
+  };
+}
+
 function localizationText(symbol: SymbolRecord): string | undefined {
   if (symbol.kind !== "localization") {
     return undefined;
@@ -901,11 +879,74 @@ function localizationLanguage(symbol: SymbolRecord): string | null | undefined {
 }
 
 function parsedDocumentForSymbol(symbol: SymbolRecord): ParsedDocument | undefined {
-  const live = liveDocuments.get(pathToFileURL(symbol.path).toString())?.parsed;
+  const live = parsedDocumentForUri(pathToFileURL(symbol.path).toString());
   if (live) {
     return live;
   }
   return index.documents.get(symbol.path);
+}
+
+function parsedDocumentForUri(uri: string): ParsedDocument | undefined {
+  return liveDocuments.get(uri)?.parsed;
+}
+
+function sendIndexStatus(payload: IndexStatusPayload): void {
+  connection.sendNotification("ck3/indexStatus", payload);
+}
+
+function timeRequest<T>(label: string, fn: () => T): T {
+  const started = Date.now();
+  try {
+    return fn();
+  } finally {
+    const elapsed = Date.now() - started;
+    if (elapsed >= 50) {
+      connection.console.info(`[timing] ${label} ${elapsed}ms`);
+    }
+  }
+}
+
+async function buildIndexInWorker(currentConfig: ServerConfig): Promise<WorkspaceIndex> {
+  const workerPath = path.join(__dirname, "indexWorker.js");
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerPath, {
+      workerData: currentConfig,
+    });
+
+    worker.once("message", (message: {
+      ok: boolean;
+      index?: {
+        symbols: Array<[string, SymbolRecord[]]>;
+        references: Array<[string, ReferenceRecord[]]>;
+        documents: Array<[string, ParsedDocument]>;
+        files: string[];
+      };
+      error?: string;
+    }) => {
+      worker.terminate().catch(() => undefined);
+      if (!message.ok || !message.index) {
+        reject(new Error(message.error ?? "Unknown index worker failure."));
+        return;
+      }
+      resolve({
+        symbols: new Map(message.index.symbols),
+        references: new Map(message.index.references),
+        documents: new Map(message.index.documents),
+        files: message.index.files,
+      });
+    });
+
+    worker.once("error", (error) => {
+      worker.terminate().catch(() => undefined);
+      reject(error);
+    });
+
+    worker.once("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Index worker exited with code ${code}.`));
+      }
+    });
+  });
 }
 
 function symbolMatchesCompletionKinds(symbolKind: string, completionKinds: string[]): boolean {

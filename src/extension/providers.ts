@@ -12,6 +12,55 @@ const SELECTOR: vscode.DocumentSelector = [
   { scheme: "file", pattern: "**/*.{txt,gui,info,asset,yml}" },
 ];
 
+export function registerHoverProvider(context: vscode.ExtensionContext, store: IndexStore): vscode.Disposable {
+  const hoverDisposable = vscode.languages.registerHoverProvider(SELECTOR, {
+    async provideHover(document, position) {
+      const word = findReferenceWord(document, position);
+      if (!word) {
+        return undefined;
+      }
+      const parsed = parseLiveDocument(document);
+      const name = document.getText(word);
+      const syntaxHelp = getScriptSyntaxHelp(name, parsed ? syntaxHelpContextAt(parsed, word) : undefined);
+      if (syntaxHelp) {
+        const markdown = new vscode.MarkdownString(
+          `**${syntaxHelp.id}**\n\n${syntaxHelp.title}\n\n${syntaxHelp.summary}\n\n${syntaxHelp.details.join("\n\n")}`
+        );
+        return new vscode.Hover(markdown, word);
+      }
+      const symbols = await store.symbolsByName(name);
+      const target = symbols.find((item) => item.kind !== "localization-reference");
+      if (!target) {
+        return undefined;
+      }
+      const referenceCount = (await store.referencesByName(name)).length;
+      const markdown = new vscode.MarkdownString(
+        `**${target.name}**\n\nType: \`${target.kind}\`\n\nSource: \`${target.source}\`\n\nReferences: \`${referenceCount}\`\n\nPath: \`${target.path}\``
+      );
+      return new vscode.Hover(markdown, word);
+    },
+  });
+
+  const syncDisposable = vscode.Disposable.from(
+    vscode.workspace.onDidOpenTextDocument((document) => { store.syncTextDocument(document); }),
+    vscode.workspace.onDidChangeTextDocument((event) => { store.syncTextDocument(event.document); }),
+    vscode.workspace.onDidCloseTextDocument((document) => { store.removeDocument(document.uri); }),
+    new vscode.Disposable(() => {
+      for (const document of vscode.workspace.textDocuments) {
+        store.removeDocument(document.uri);
+      }
+    })
+  );
+
+  for (const document of vscode.workspace.textDocuments) {
+    store.syncTextDocument(document);
+  }
+
+  const disposable = vscode.Disposable.from(hoverDisposable, syncDisposable);
+  context.subscriptions.push(disposable);
+  return disposable;
+}
+
 export function registerProviders(context: vscode.ExtensionContext, store: IndexStore): vscode.Disposable {
   const disposables: vscode.Disposable[] = [
     vscode.languages.registerDefinitionProvider(SELECTOR, {
@@ -29,33 +78,6 @@ export function registerProviders(context: vscode.ExtensionContext, store: Index
           return undefined;
         }
         return relevant.map(toLocation);
-      },
-    }),
-    vscode.languages.registerHoverProvider(SELECTOR, {
-      async provideHover(document, position) {
-        const word = findReferenceWord(document, position);
-        if (!word) {
-          return undefined;
-        }
-        const parsed = parseLiveDocument(document);
-        const name = document.getText(word);
-        const syntaxHelp = getScriptSyntaxHelp(name, parsed ? syntaxHelpContextAt(parsed, word) : undefined);
-        if (syntaxHelp) {
-          const markdown = new vscode.MarkdownString(
-            `**${syntaxHelp.id}**\n\n${syntaxHelp.title}\n\n${syntaxHelp.summary}\n\n${syntaxHelp.details.join("\n\n")}`
-          );
-          return new vscode.Hover(markdown, word);
-        }
-        const symbols = await store.symbolsByName(name);
-        const target = symbols.find((item) => item.kind !== "localization-reference");
-        if (!target) {
-          return undefined;
-        }
-        const referenceCount = (await store.referencesByName(name)).length;
-        const markdown = new vscode.MarkdownString(
-          `**${target.name}**\n\nType: \`${target.kind}\`\n\nSource: \`${target.source}\`\n\nReferences: \`${referenceCount}\`\n\nPath: \`${target.path}\``
-        );
-        return new vscode.Hover(markdown, word);
       },
     }),
     vscode.languages.registerReferenceProvider(SELECTOR, {
@@ -92,38 +114,8 @@ export function registerProviders(context: vscode.ExtensionContext, store: Index
           return item;
         });
       },
-    }, ".", ":", "=")
+  }, ".", ":", "=")
   ];
-
-  const diagnostics = vscode.languages.createDiagnosticCollection("ck3ModDevkitFallback");
-  disposables.push(diagnostics);
-
-  const refreshDiagnostics = async (document: vscode.TextDocument) => {
-    if (!matchesCk3Document(document)) {
-      return;
-    }
-    store.syncTextDocument(document);
-    diagnostics.set(document.uri, await collectDiagnostics(document, store));
-  };
-
-  disposables.push(
-    vscode.workspace.onDidOpenTextDocument((document) => { void refreshDiagnostics(document); }),
-    vscode.workspace.onDidChangeTextDocument((event) => { void refreshDiagnostics(event.document); }),
-    vscode.workspace.onDidSaveTextDocument(async (document) => {
-      store.syncTextDocument(document);
-      await store.refreshFor(document.uri);
-      await refreshDiagnostics(document);
-    }),
-    vscode.workspace.onDidCloseTextDocument((document) => {
-      store.removeDocument(document.uri);
-      diagnostics.delete(document.uri);
-    })
-  );
-
-  for (const document of vscode.workspace.textDocuments) {
-    store.syncTextDocument(document);
-    void refreshDiagnostics(document);
-  }
 
   const disposable = new vscode.Disposable(() => {
     for (const item of disposables) {

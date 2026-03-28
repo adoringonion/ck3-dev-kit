@@ -12,14 +12,64 @@ import { createLanguageClient } from "./lsp/client";
 
 let activeBackendManager: BackendManager<LanguageClient> | undefined;
 
+type IndexPhase = "started" | "completed" | "failed" | "busy";
+
+interface IndexStatusPayload {
+  phase: IndexPhase;
+  reason: string;
+  message?: string;
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const fallbackStore = new IndexStore();
   const output = vscode.window.createOutputChannel("CK3 Mod DevKit");
+  const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  statusBar.name = "CK3 Mod DevKit";
   context.subscriptions.push(output);
+  context.subscriptions.push(statusBar);
+  let indexBusy = false;
 
   const backendManager = new BackendManager<LanguageClient>({
     createLanguageClient: async () => {
       const nextClient = createLanguageClient(context, readConfig(), output);
+      nextClient.onNotification("ck3/indexStatus", (payload: IndexStatusPayload) => {
+        const timestamp = `[${new Date().toISOString()}]`;
+        if (payload.phase === "started") {
+          indexBusy = true;
+          statusBar.text = "$(sync~spin) CK3 Indexing";
+          statusBar.tooltip = `CK3 Mod DevKit is building the symbol index (${payload.reason}).`;
+          statusBar.show();
+          output.appendLine(`${timestamp} Index build started: ${payload.reason}`);
+          return;
+        }
+        if (payload.phase === "busy") {
+          indexBusy = true;
+          statusBar.text = "$(sync~spin) CK3 Indexing";
+          statusBar.tooltip = "CK3 Mod DevKit is already building the symbol index.";
+          statusBar.show();
+          output.appendLine(`${timestamp} Index build already in progress: ${payload.reason}`);
+          return;
+        }
+        if (payload.phase === "completed") {
+          indexBusy = false;
+          statusBar.hide();
+          output.appendLine(`${timestamp} Index build completed: ${payload.reason}`);
+          if (payload.reason === "startup") {
+            void vscode.window.setStatusBarMessage("CK3 symbol index ready.", 3000);
+          }
+          return;
+        }
+
+        indexBusy = false;
+        statusBar.text = "$(error) CK3 Index Failed";
+        statusBar.tooltip = payload.message ?? "CK3 Mod DevKit failed to build the symbol index.";
+        statusBar.show();
+        output.appendLine(`${timestamp} Index build failed: ${payload.reason}`);
+        if (payload.message) {
+          output.appendLine(payload.message);
+        }
+        void vscode.window.showErrorMessage("CK3 Mod DevKit failed to build its index. Check the 'CK3 Mod DevKit' output channel.");
+      });
       context.subscriptions.push(nextClient);
       output.appendLine(`[${new Date().toISOString()}] Starting language server.`);
       await nextClient.start();
@@ -32,6 +82,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   activeBackendManager = backendManager;
 
   const rebuildIndex = async (reason: string, notify = false) => {
+    if (indexBusy) {
+      output.appendLine(`[${new Date().toISOString()}] Skipped rebuild because indexing is already running: ${reason}`);
+      if (notify) {
+        void vscode.window.showInformationMessage("CK3 Mod DevKit is already building the symbol index.");
+      }
+      return;
+    }
     try {
       output.appendLine(`[${new Date().toISOString()}] Rebuilding index: ${reason}`);
       const activeBackend = await backendManager.rebuild();
@@ -61,6 +118,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     output.appendLine(message);
     backendManager.enableFallback();
     void vscode.window.showWarningMessage("CK3 Mod DevKit language server failed to start. Using fallback providers.");
+    void rebuildIndex("fallback activation");
   }
 
   context.subscriptions.push(
@@ -117,12 +175,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           output.appendLine(message);
           backendManager.enableFallback();
         }
-        await rebuildIndex("configuration change");
+        if (backendManager.isUsingFallback()) {
+          await rebuildIndex("configuration change");
+        }
       }
     })
   );
-
-  void rebuildIndex("activation");
 }
 
 export async function deactivate(): Promise<void> {

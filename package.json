@@ -136,7 +136,7 @@
     "watch": "node ./node_modules/typescript/bin/tsc -w -p .",
     "check": "node ./node_modules/typescript/bin/tsc -p . --noEmit",
     "test": "npm run build && node --test test/core.test.js && node --test test/cli.test.js && node --test test/lsp.test.js && node --test test/backend-manager.test.js",
-    "package:vsix": "npm run build && node ./node_modules/@vscode/vsce/vsce package --no-dependencies",
+    "package:vsix": "npm run build && node ./node_modules/@vscode/vsce/vsce package",
     "index": "node dist/cli.js",
     "find-symbol": "node dist/find-symbol.js",
     "find-references": "node dist/find-references.js",
@@ -148,13 +148,15 @@
     "validate-references": "node dist/validate-references.js",
     "generate-skill": "node dist/generate-skill.js"
   },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.11"
+  },
   "devDependencies": {
     "@types/node": "^18.19.24",
     "@types/vscode": "^1.86.0",
     "@vscode/vsce": "^2.15.0",
-    "typescript": "^5.4.5",
-    "vscode-languageclient": "^9.0.1",
-    "vscode-languageserver": "^9.0.1",
-    "vscode-languageserver-textdocument": "^1.0.11"
+    "typescript": "^5.4.5"
   }
 }

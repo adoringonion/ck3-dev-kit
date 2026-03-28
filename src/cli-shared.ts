@@ -32,10 +32,15 @@ export function buildIndexFromArgs(args: string[]): WorkspaceIndex {
   });
 }
 
-export function buildCachedWorkspaceIndex(options: { modRoots: string[]; referenceRoots: string[]; maxFiles: number }): WorkspaceIndex {
+export function buildCachedWorkspaceIndex(options: {
+  modRoots: string[];
+  referenceRoots: string[];
+  maxFiles: number;
+  trustReferenceCaches?: boolean;
+}): WorkspaceIndex {
   const parts = [
-    ...options.modRoots.map((root) => loadOrBuildRootIndex(root, "mod", options.maxFiles)),
-    ...options.referenceRoots.map((root) => loadOrBuildRootIndex(root, "reference", options.maxFiles)),
+    ...options.modRoots.map((root) => loadOrBuildRootIndex(root, "mod", options.maxFiles, options.trustReferenceCaches ?? false)),
+    ...options.referenceRoots.map((root) => loadOrBuildRootIndex(root, "reference", options.maxFiles, options.trustReferenceCaches ?? false)),
   ];
   return mergeWorkspaceIndices(parts);
 }
@@ -140,9 +145,17 @@ function manifestsMatch(left: WorkspaceFileRecord[], right: WorkspaceFileRecord[
   return true;
 }
 
-function loadOrBuildRootIndex(root: string, source: "mod" | "reference", maxFiles: number): WorkspaceIndex {
+function loadOrBuildRootIndex(
+  root: string,
+  source: "mod" | "reference",
+  maxFiles: number,
+  trustReferenceCaches: boolean
+): WorkspaceIndex {
   const cachePath = indexCachePath({ root, source, maxFiles });
   const cached = readCachedIndex(cachePath);
+  if (source === "reference" && trustReferenceCaches && cached) {
+    return hydrateCachedIndex(cached);
+  }
 
   const manifest = collectWorkspaceFiles({
     modRoots: source === "mod" ? [root] : [],

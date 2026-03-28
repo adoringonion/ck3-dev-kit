@@ -600,6 +600,42 @@ test("buildCachedWorkspaceIndex refreshes reference roots when files change", ()
   }
 });
 
+test("buildCachedWorkspaceIndex can trust reference caches for fast startup", () => {
+  const tempRoot = fs.mkdtempSync(path.join(localTempRoot, "ck3-devkit-trusted-ref-cache-test-"));
+  const modRoot = path.join(tempRoot, "mod");
+  const referenceRoot = path.join(tempRoot, "game");
+  const referenceEventsDir = path.join(referenceRoot, "events");
+
+  fs.mkdirSync(modRoot, { recursive: true });
+  fs.mkdirSync(referenceEventsDir, { recursive: true });
+
+  try {
+    const referenceFile = path.join(referenceEventsDir, "reference_events.txt");
+    fs.writeFileSync(referenceFile, "namespace = sample_mod\nsample_mod.0001 = { }\n", "utf8");
+
+    buildCachedWorkspaceIndex({
+      modRoots: [modRoot],
+      referenceRoots: [referenceRoot],
+      maxFiles: 100,
+    });
+
+    fs.writeFileSync(referenceFile, "namespace = sample_mod\nsample_mod.0002 = { }\n", "utf8");
+
+    const trustedIndex = buildCachedWorkspaceIndex({
+      modRoots: [modRoot],
+      referenceRoots: [referenceRoot],
+      maxFiles: 100,
+      trustReferenceCaches: true,
+    });
+
+    assert.ok(trustedIndex.symbols.has("sample_mod.0001"));
+    assert.ok(!trustedIndex.symbols.has("sample_mod.0002"));
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(path.join(process.cwd(), ".cache"), { recursive: true, force: true });
+  }
+});
+
 test("buildCachedWorkspaceIndex preserves parsed documents through cache hydration", () => {
   const tempRoot = fs.mkdtempSync(path.join(localTempRoot, "ck3-devkit-doc-cache-test-"));
   const modRoot = path.join(tempRoot, "mod");
