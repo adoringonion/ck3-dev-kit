@@ -79,7 +79,7 @@ export function incrementalParseScript(previous: ParsedDocument, nextText: strin
   if (!affected) {
     const insertion = affectedInsertion(previous, change.start, change.oldEnd);
     if (insertion) {
-      return applyInsertedTopLevelEntries(previous, nextText, insertion);
+      return applyInsertedTopLevelEntries(previous, nextText, nextTokens, insertion);
     }
     return parseScriptFromTokens(nextText, nextTokens);
   }
@@ -213,7 +213,7 @@ function applyNestedObjectUpdate(
     errors: [...keptErrors, ...shiftedErrors],
     text: nextText,
     range: nextCursor.range(0, nextText.length),
-    tokens: incrementalScanTokens(previous.tokens, previous.text, nextText, changedRegion(previous.text, nextText) ?? { start: 0, oldEnd: previous.text.length }).tokens,
+    tokens: nextTokens,
   };
 }
 
@@ -270,7 +270,7 @@ function applyNestedListUpdate(
     errors: [...keptErrors, ...bodyUpdate.errors],
     text: nextText,
     range: nextCursor.range(0, nextText.length),
-    tokens: incrementalScanTokens(previous.tokens, previous.text, nextText, changedRegion(previous.text, nextText) ?? { start: 0, oldEnd: previous.text.length }).tokens,
+    tokens: nextTokens,
   };
 }
 
@@ -483,16 +483,13 @@ function rebuildNestedListItems(
 function applyInsertedTopLevelEntries(
   previous: ScriptDocument,
   nextText: string,
+  nextTokens: ScriptToken[],
   insertion: { insertIndex: number; start: number; end: number },
 ): ScriptDocument {
   const nextCursor = new TextCursor(nextText);
   const delta = nextText.length - previous.text.length;
   const fragment = nextText.slice(insertion.start, insertion.end + delta);
-  const fragmentTokens = sliceTokens(
-    incrementalScanTokens(previous.tokens, previous.text, nextText, changedRegion(previous.text, nextText) ?? { start: 0, oldEnd: previous.text.length }).tokens,
-    insertion.start,
-    insertion.end + delta,
-  );
+  const fragmentTokens = sliceTokens(nextTokens, insertion.start, insertion.end + delta);
   const reparsed = parseScriptEntriesFromTokens(fragment, normalizeTokens(fragmentTokens, insertion.start));
   const shiftedEntries = reparsed.entries.map((entry) => shiftAssignment(entry, insertion.start, nextCursor));
   const shiftedErrors = reparsed.errors.map((error) => shiftError(error, insertion.start, nextCursor));
@@ -517,7 +514,7 @@ function applyInsertedTopLevelEntries(
     errors,
     text: nextText,
     range: nextCursor.range(0, nextText.length),
-    tokens: incrementalScanTokens(previous.tokens, previous.text, nextText, changedRegion(previous.text, nextText) ?? { start: 0, oldEnd: previous.text.length }).tokens,
+    tokens: nextTokens,
   };
 }
 

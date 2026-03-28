@@ -51,6 +51,34 @@ export class QueryEngine {
     this.active.length = 0;
   }
 
+  stats(): {
+    valueCount: number;
+    dependencyEdgeCount: number;
+    reverseDependencyEdgeCount: number;
+    tagCount: number;
+    taggedQueryCount: number;
+  } {
+    let dependencyEdgeCount = 0;
+    for (const deps of this.deps.values()) {
+      dependencyEdgeCount += deps.size;
+    }
+    let reverseDependencyEdgeCount = 0;
+    for (const deps of this.reverseDeps.values()) {
+      reverseDependencyEdgeCount += deps.size;
+    }
+    let taggedQueryCount = 0;
+    for (const tagged of this.reverseTags.values()) {
+      taggedQueryCount += tagged.size;
+    }
+    return {
+      valueCount: this.values.size,
+      dependencyEdgeCount,
+      reverseDependencyEdgeCount,
+      tagCount: this.reverseTags.size,
+      taggedQueryCount,
+    };
+  }
+
   markDirty(key: string): void {
     this.invalidate(key);
   }

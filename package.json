@@ -144,6 +144,7 @@
     "cache-info": "node dist/cache-info.js",
     "rebuild-cache": "node dist/rebuild-cache.js",
     "analyze-error-log": "node dist/analyze-error-log.js",
+    "benchmark:lsp": "node dist/benchmark-lsp.js",
     "parse-file": "node dist/parse-file.js",
     "diagnostics": "node dist/diagnostics.js",
     "validate-references": "node dist/validate-references.js",

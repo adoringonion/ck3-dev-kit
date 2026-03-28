@@ -477,6 +477,26 @@ test("QueryEngine invalidates dependent queries transitively", () => {
   assert.equal(leafRuns, 2);
 });
 
+test("QueryEngine reports cache stats", () => {
+  const engine = new QueryEngine();
+  engine.evaluate(
+    "parent",
+    () => engine.evaluate(
+      "child",
+      () => "value",
+      ["child-tag"],
+    ),
+    ["parent-tag"],
+  );
+
+  const stats = engine.stats();
+  assert.equal(stats.valueCount, 2);
+  assert.equal(stats.dependencyEdgeCount, 1);
+  assert.equal(stats.reverseDependencyEdgeCount, 1);
+  assert.equal(stats.tagCount, 2);
+  assert.equal(stats.taggedQueryCount, 2);
+});
+
 test("ServerSnapshot keeps a fixed symbol view after live state changes", () => {
   const state = new ServerState();
   state.setConfig({

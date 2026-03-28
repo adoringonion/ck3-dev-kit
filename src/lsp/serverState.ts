@@ -117,6 +117,10 @@ export class ServerState {
     return this.config;
   }
 
+  queryStats(): ReturnType<QueryEngine["stats"]> {
+    return this.queryEngine.stats();
+  }
+
   setIndex(index: WorkspaceIndex): void {
     this.index = index;
     this.indexedSymbolsByPath = groupSymbolsByPath(index.symbols);
