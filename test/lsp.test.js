@@ -9,6 +9,7 @@ const {
   buildDocumentDiagnosticReport,
   buildRenameWorkspaceEdit,
   buildSemanticTokens,
+  createAddUtf8BomCodeAction,
   createMissingScriptDefinitionCodeAction,
   createMissingLocalizationCodeAction,
   SEMANTIC_TOKEN_TYPES,
@@ -126,6 +127,22 @@ test("createMissingScriptDefinitionCodeAction creates a scripted effect stub", (
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
+});
+
+test("createAddUtf8BomCodeAction inserts a BOM at the file start", () => {
+  const action = createAddUtf8BomCodeAction(
+    {
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 1 },
+      },
+      message: "Localization files should be saved as UTF-8 with BOM.",
+    },
+    "file:///D:/mod/localization/english/sample_l_english.yml"
+  );
+
+  assert.equal(action.title, "Add UTF-8 BOM");
+  assert.equal(action.edit.changes["file:///D:/mod/localization/english/sample_l_english.yml"][0].newText, "\uFEFF");
 });
 
 test("buildDocumentDiagnosticReport wraps diagnostics as full report", () => {

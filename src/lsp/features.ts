@@ -178,6 +178,25 @@ export function createMissingScriptDefinitionCodeAction(
   };
 }
 
+export function createAddUtf8BomCodeAction(diagnostic: Diagnostic, documentUri: string): CodeAction {
+  return {
+    title: "Add UTF-8 BOM",
+    kind: CodeActionKind.QuickFix,
+    diagnostics: [diagnostic],
+    edit: {
+      changes: {
+        [documentUri]: [{
+          range: {
+            start: { line: 0, character: 0 },
+            end: { line: 0, character: 0 },
+          },
+          newText: "\uFEFF",
+        }],
+      },
+    },
+  };
+}
+
 export function toWorkspaceSymbol(symbol: SymbolRecord): WorkspaceSymbol {
   return {
     name: symbol.name,

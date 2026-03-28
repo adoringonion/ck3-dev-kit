@@ -43,6 +43,7 @@ import {
   buildInlayHints,
   buildRenameWorkspaceEdit,
   buildSemanticTokens,
+  createAddUtf8BomCodeAction,
   createMissingScriptDefinitionCodeAction,
   completionDocumentation,
   createMissingLocalizationCodeAction,
@@ -314,6 +315,10 @@ connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): 
 connection.onCodeAction((params): CodeAction[] => {
   const actions: CodeAction[] = [];
   for (const diagnostic of params.context.diagnostics) {
+    if (diagnostic.message === "Localization files should be saved as UTF-8 with BOM.") {
+      actions.push(createAddUtf8BomCodeAction(diagnostic, params.textDocument.uri));
+      continue;
+    }
     const unresolvedLocalization = diagnostic.message.match(/^Unresolved localization reference: ([\w.:-]+)$/);
     if (!unresolvedLocalization) {
       const unresolvedScriptDefinition = diagnostic.message.match(/^Unresolved (scripted_effect|scripted_trigger|script_value) reference: ([\w.:-]+)$/);
@@ -466,7 +471,7 @@ function collectValidationDiagnostics(parsed: ParsedDocument, filePath: string):
     symbols: overlayedSymbols,
   });
 
-  return validation.map((entry) => ({
+  const diagnostics = validation.map((entry) => ({
     severity:
       entry.severity === "error"
         ? DiagnosticSeverity.Error
@@ -477,6 +482,20 @@ function collectValidationDiagnostics(parsed: ParsedDocument, filePath: string):
     range: toLspRange(entry.range),
     source: "ck3-devkit",
   }));
+
+  if (parsed.kind === "localization" && resolveSource(filePath) === "mod" && !parsed.text.startsWith("\uFEFF")) {
+    diagnostics.push({
+      severity: DiagnosticSeverity.Warning,
+      message: "Localization files should be saved as UTF-8 with BOM.",
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 1 },
+      },
+      source: "ck3-devkit",
+    });
+  }
+
+  return diagnostics;
 }
 
 function overlaySymbols(documentUri: string, symbols: SymbolRecord[]): Map<string, SymbolRecord[]> {
