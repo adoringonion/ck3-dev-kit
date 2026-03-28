@@ -40,6 +40,17 @@ interface VersionedCacheEntry<T> {
   value: T;
 }
 
+interface DerivedSymbolState {
+  revision: number;
+  byName: Map<string, SymbolRecord[]>;
+  all: SymbolRecord[];
+}
+
+interface DerivedReferenceState {
+  revision: number;
+  byName: Map<string, ReferenceRecord[]>;
+}
+
 export class ServerState {
   private config: ServerConfig = {
     modRoots: [],
@@ -65,8 +76,13 @@ export class ServerState {
   private diagnosticTimers = new Map<string, NodeJS.Timeout>();
   private workspaceDiagnosticRun = 0;
   private indexRevision = 0;
+  private stateRevision = 0;
   private indexReady = false;
   private lastIndexError: string | null = null;
+  private derivedSymbols: DerivedSymbolState | null = null;
+  private derivedReferences: DerivedReferenceState | null = null;
+  private completionQueryCache = new Map<string, SymbolRecord[]>();
+  private workspaceSymbolQueryCache = new Map<string, SymbolRecord[]>();
 
   setConfig(config: ServerConfig): void {
     this.config = config;
@@ -81,6 +97,7 @@ export class ServerState {
     this.indexedSymbolsByPath = groupSymbolsByPath(index.symbols);
     this.indexedReferencesByPath = groupReferencesByPath(index.references);
     this.indexRevision += 1;
+    this.bumpStateRevision();
     this.indexReady = true;
     this.lastIndexError = null;
     this.clearTransientState();
@@ -124,6 +141,7 @@ export class ServerState {
       source,
     };
     this.liveDocuments.set(document.uri, record);
+    this.bumpStateRevision();
     this.clearDocumentFeatureCaches(document.uri);
     return record;
   }
@@ -142,12 +160,15 @@ export class ServerState {
       source,
     };
     this.liveDocuments.set(document.uri, record);
+    this.bumpStateRevision();
     this.clearDocumentFeatureCaches(document.uri);
     return record;
   }
 
   deleteLiveDocument(uri: string): void {
-    this.liveDocuments.delete(uri);
+    if (this.liveDocuments.delete(uri)) {
+      this.bumpStateRevision();
+    }
     this.deleteDiagnosticCache(uri);
     this.clearDocumentFeatureCaches(uri);
   }
@@ -269,30 +290,15 @@ export class ServerState {
   }
 
   symbolsByName(name: string): SymbolRecord[] {
-    const liveUris = new Set(this.liveDocuments.keys());
-    const base = (this.index.symbols.get(name) ?? []).filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
-    const live = Array.from(this.liveDocuments.values())
-      .flatMap((record) => record.symbols)
-      .filter((entry) => entry.name === name);
-    return [...base, ...live];
+    return this.getDerivedSymbols().byName.get(name) ?? [];
   }
 
   referencesByName(name: string): ReferenceRecord[] {
-    const liveUris = new Set(this.liveDocuments.keys());
-    const base = (this.index.references.get(name) ?? []).filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
-    const live = Array.from(this.liveDocuments.values())
-      .flatMap((record) => record.references)
-      .filter((entry) => entry.name === name);
-    return [...base, ...live];
+    return this.getDerivedReferences().byName.get(name) ?? [];
   }
 
   allSymbols(query?: string): SymbolRecord[] {
-    const liveUris = new Set(this.liveDocuments.keys());
-    const base = Array.from(this.index.symbols.values())
-      .flat()
-      .filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
-    const live = Array.from(this.liveDocuments.values()).flatMap((record) => record.symbols);
-    const merged = [...base, ...live];
+    const merged = this.getDerivedSymbols().all;
     if (!query) {
       return merged;
     }
@@ -367,7 +373,9 @@ export class ServerState {
       this.deleteLiveDocument(document.uri);
       return;
     }
-    this.liveDocuments.delete(document.uri);
+    if (this.liveDocuments.delete(document.uri)) {
+      this.bumpStateRevision();
+    }
     this.deleteDiagnosticCache(document.uri);
     this.clearDocumentFeatureCaches(document.uri);
   }
@@ -398,6 +406,7 @@ export class ServerState {
       source,
     };
     this.liveDocuments.set(uri, record);
+    this.bumpStateRevision();
     this.deleteDiagnosticCache(uri);
     this.clearDocumentFeatureCaches(uri);
     return record;
@@ -424,17 +433,16 @@ export class ServerState {
   }
 
   completionSymbols(kinds: string[], query = "", limit = 100): SymbolRecord[] {
-    const lowered = query.toLowerCase();
-    const matches: SymbolRecord[] = [];
-    const grouped = new Map<string, SymbolRecord[]>();
-
-    for (const symbol of this.allSymbols()) {
-      const existing = grouped.get(symbol.name) ?? [];
-      existing.push(symbol);
-      grouped.set(symbol.name, existing);
+    const normalizedKinds = [...kinds].sort().join(",");
+    const cacheKey = `${normalizedKinds}::${query.toLowerCase()}::${limit}`;
+    const cached = this.completionQueryCache.get(cacheKey);
+    if (cached) {
+      return cached;
     }
 
-    for (const records of grouped.values()) {
+    const lowered = query.toLowerCase();
+    const matches: SymbolRecord[] = [];
+    for (const records of this.getDerivedSymbols().byName.values()) {
       const relevant = records
         .filter((symbol) => symbolMatchesCompletionKinds(symbol.kind, kinds))
         .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
@@ -462,7 +470,9 @@ export class ServerState {
       return left.name.localeCompare(right.name);
     });
 
-    return matches.slice(0, limit);
+    const result = matches.slice(0, limit);
+    this.completionQueryCache.set(cacheKey, result);
+    return result;
   }
 
   definitionSymbols(name: string): SymbolRecord[] {
@@ -476,7 +486,14 @@ export class ServerState {
   }
 
   workspaceSymbols(query?: string): SymbolRecord[] {
-    return this.allSymbols(query).filter((symbol) => symbol.kind !== "localization-reference");
+    const cacheKey = query?.toLowerCase() ?? "";
+    const cached = this.workspaceSymbolQueryCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const result = this.allSymbols(query).filter((symbol) => symbol.kind !== "localization-reference");
+    this.workspaceSymbolQueryCache.set(cacheKey, result);
+    return result;
   }
 
   preferredLocalizationFile(): string | null {
@@ -687,6 +704,77 @@ export class ServerState {
 
   cancelWorkspaceDiagnostics(): void {
     this.workspaceDiagnosticRun += 1;
+  }
+
+  private bumpStateRevision(): void {
+    this.stateRevision += 1;
+    this.derivedSymbols = null;
+    this.derivedReferences = null;
+    this.completionQueryCache.clear();
+    this.workspaceSymbolQueryCache.clear();
+  }
+
+  private getDerivedSymbols(): DerivedSymbolState {
+    if (this.derivedSymbols && this.derivedSymbols.revision === this.stateRevision) {
+      return this.derivedSymbols;
+    }
+    const liveUris = new Set(this.liveDocuments.keys());
+    const byName = new Map<string, SymbolRecord[]>();
+    const all: SymbolRecord[] = [];
+
+    for (const [name, entries] of this.index.symbols.entries()) {
+      const filtered = entries.filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
+      if (filtered.length === 0) {
+        continue;
+      }
+      byName.set(name, [...filtered]);
+      all.push(...filtered);
+    }
+
+    for (const record of this.liveDocuments.values()) {
+      for (const entry of record.symbols) {
+        const existing = byName.get(entry.name) ?? [];
+        existing.push(entry);
+        byName.set(entry.name, existing);
+        all.push(entry);
+      }
+    }
+
+    this.derivedSymbols = {
+      revision: this.stateRevision,
+      byName,
+      all,
+    };
+    return this.derivedSymbols;
+  }
+
+  private getDerivedReferences(): DerivedReferenceState {
+    if (this.derivedReferences && this.derivedReferences.revision === this.stateRevision) {
+      return this.derivedReferences;
+    }
+    const liveUris = new Set(this.liveDocuments.keys());
+    const byName = new Map<string, ReferenceRecord[]>();
+
+    for (const [name, entries] of this.index.references.entries()) {
+      const filtered = entries.filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
+      if (filtered.length > 0) {
+        byName.set(name, [...filtered]);
+      }
+    }
+
+    for (const record of this.liveDocuments.values()) {
+      for (const entry of record.references) {
+        const existing = byName.get(entry.name) ?? [];
+        existing.push(entry);
+        byName.set(entry.name, existing);
+      }
+    }
+
+    this.derivedReferences = {
+      revision: this.stateRevision,
+      byName,
+    };
+    return this.derivedReferences;
   }
 
   private collectValidationDiagnostics(
