@@ -5,16 +5,19 @@ import {
   CodeAction,
   CodeActionKind,
   CompletionItemKind,
+  CreateFile,
   Diagnostic,
   DocumentDiagnosticReportKind,
   FullDocumentDiagnosticReport,
   InlayHint,
   MarkupKind,
+  OptionalVersionedTextDocumentIdentifier,
   Position,
   Range,
   SemanticTokensBuilder,
   SymbolKind,
   TextEdit,
+  TextDocumentEdit,
   WorkspaceEdit,
   WorkspaceSymbol,
 } from "vscode-languageserver/node";
@@ -46,6 +49,13 @@ export function buildSemanticTokens(parsed: ParsedDocument): { data: number[] } 
   pushRegexTokens(tokens, parsed.text, /"([^"\\]|\\.)*"/g, "string");
   pushRegexTokens(tokens, parsed.text, /(^|[=\s\[{])(-?\d+(?:\.\d+)?)(?=$|[\s\]}])/gm, "number", 2);
   pushRegexTokens(tokens, parsed.text, /(<=|>=|!=|=|<|>|\{|\}|\[|\])/g, "operator");
+  pushRegexTokens(tokens, parsed.text, /\b[a-zA-Z0-9_]+\.\d+\b/g, "event");
+  pushRegexTokens(tokens, parsed.text, /\b(?:var|local_var|global_var|named_script_value|named_script_value_item):[\w.-]+\b/g, "variable");
+  pushRegexTokens(tokens, parsed.text, /\b(?:scope|event_target):[\w.-]+\b/g, "class");
+  pushRegexTokens(tokens, parsed.text, /\b(?:doctrine|doctrine_parameter|cultural_tradition|cultural_pillar):[\w.-]+\b/g, "enum");
+  pushRegexTokens(tokens, parsed.text, /\b(?:trait):[\w.-]+\b/g, "enumMember");
+  pushRegexTokens(tokens, parsed.text, /\b(?:culture|faith|religion):[\w.-]+\b/g, "class");
+  pushRegexTokens(tokens, parsed.text, /\b(?:scripted_effect|scripted_trigger):[\w.-]+\b/g, "function");
 
   if (parsed.kind === "script") {
     for (const entry of flattenScriptEntries(parsed.entries)) {
@@ -142,6 +152,29 @@ export function createMissingLocalizationCodeAction(
         ],
       },
     },
+  };
+}
+
+export function createMissingScriptDefinitionCodeAction(
+  diagnostic: Diagnostic,
+  symbolName: string,
+  kind: "scripted_effect" | "scripted_trigger" | "script_value",
+  filePath: string | null
+): CodeAction | null {
+  if (!filePath) {
+    return null;
+  }
+
+  const stub = scriptDefinitionStub(symbolName, kind);
+  if (!stub) {
+    return null;
+  }
+
+  return {
+    title: `Create ${kind} '${symbolName}'`,
+    kind: CodeActionKind.QuickFix,
+    diagnostics: [diagnostic],
+    edit: appendOrCreateWorkspaceEdit(filePath, stub),
   };
 }
 
@@ -252,6 +285,45 @@ function appendEdit(target: Map<string, TextEdit[]>, uri: string, range: CoreRan
   target.set(uri, existing);
 }
 
+function appendOrCreateWorkspaceEdit(filePath: string, text: string): WorkspaceEdit {
+  const uri = pathToFileURL(filePath).toString();
+  if (fs.existsSync(filePath)) {
+    const insertPosition = endOfFilePosition(filePath);
+    return {
+      changes: {
+        [uri]: [{
+          range: {
+            start: insertPosition,
+            end: insertPosition,
+          },
+          newText: `${ensureTrailingNewline(filePath)}${text}`,
+        }],
+      },
+    };
+  }
+
+  const createFile: CreateFile = {
+    kind: "create",
+    uri,
+  };
+  const documentEdit: TextDocumentEdit = {
+    textDocument: {
+      uri,
+      version: null,
+    } as OptionalVersionedTextDocumentIdentifier,
+    edits: [{
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 0 },
+      },
+      newText: text,
+    }],
+  };
+  return {
+    documentChanges: [createFile, documentEdit],
+  };
+}
+
 function flattenScriptEntries(entries: AssignmentNode[]): AssignmentNode[] {
   const flattened: AssignmentNode[] = [];
   for (const entry of entries) {
@@ -280,6 +352,22 @@ function semanticTypeForEntry(entry: AssignmentNode): string {
     return "variable";
   }
   return "property";
+}
+
+function scriptDefinitionStub(
+  symbolName: string,
+  kind: "scripted_effect" | "scripted_trigger" | "script_value"
+): string | null {
+  switch (kind) {
+    case "scripted_effect":
+      return `${symbolName} = {\n}\n`;
+    case "scripted_trigger":
+      return `${symbolName} = {\n  always = yes\n}\n`;
+    case "script_value":
+      return `${symbolName} = 0\n`;
+    default:
+      return null;
+  }
 }
 
 function pushRegexTokens(

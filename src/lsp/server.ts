@@ -43,6 +43,7 @@ import {
   buildInlayHints,
   buildRenameWorkspaceEdit,
   buildSemanticTokens,
+  createMissingScriptDefinitionCodeAction,
   completionDocumentation,
   createMissingLocalizationCodeAction,
   describeEntry,
@@ -315,6 +316,19 @@ connection.onCodeAction((params): CodeAction[] => {
   for (const diagnostic of params.context.diagnostics) {
     const unresolvedLocalization = diagnostic.message.match(/^Unresolved localization reference: ([\w.:-]+)$/);
     if (!unresolvedLocalization) {
+      const unresolvedScriptDefinition = diagnostic.message.match(/^Unresolved (scripted_effect|scripted_trigger|script_value) reference: ([\w.:-]+)$/);
+      if (!unresolvedScriptDefinition) {
+        continue;
+      }
+      const action = createMissingScriptDefinitionCodeAction(
+        diagnostic,
+        unresolvedScriptDefinition[2],
+        unresolvedScriptDefinition[1] as "scripted_effect" | "scripted_trigger" | "script_value",
+        preferredScriptDefinitionFile(unresolvedScriptDefinition[1] as "scripted_effect" | "scripted_trigger" | "script_value")
+      );
+      if (action) {
+        actions.push(action);
+      }
       continue;
     }
     const action = createMissingLocalizationCodeAction(
@@ -635,6 +649,38 @@ function preferredLocalizationFile(): string | null {
     if (files.length > 0) {
       return files.sort()[0];
     }
+  }
+  return null;
+}
+
+function preferredScriptDefinitionFile(kind: "scripted_effect" | "scripted_trigger" | "script_value"): string | null {
+  const relativeFolder =
+    kind === "scripted_effect"
+      ? path.join("common", "scripted_effects")
+      : kind === "scripted_trigger"
+        ? path.join("common", "scripted_triggers")
+        : path.join("common", "script_values");
+  const fallbackName =
+    kind === "scripted_effect"
+      ? "zz_generated_effects.txt"
+      : kind === "scripted_trigger"
+        ? "zz_generated_triggers.txt"
+        : "zz_generated_values.txt";
+
+  for (const root of config.modRoots) {
+    const folder = path.join(root, relativeFolder);
+    if (!fsExists(folder)) {
+      const parent = path.dirname(folder);
+      if (!fsExists(parent)) {
+        continue;
+      }
+      return path.join(folder, fallbackName);
+    }
+    const files = walkFiles(folder).filter((file) => file.toLowerCase().endsWith(".txt"));
+    if (files.length > 0) {
+      return files.sort()[0];
+    }
+    return path.join(folder, fallbackName);
   }
   return null;
 }

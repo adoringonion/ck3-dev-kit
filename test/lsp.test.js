@@ -9,7 +9,9 @@ const {
   buildDocumentDiagnosticReport,
   buildRenameWorkspaceEdit,
   buildSemanticTokens,
+  createMissingScriptDefinitionCodeAction,
   createMissingLocalizationCodeAction,
+  SEMANTIC_TOKEN_TYPES,
 } = require("../dist/lsp/features");
 const {
   filterModRenameReferences,
@@ -25,6 +27,8 @@ test("buildSemanticTokens emits token data for script syntax", () => {
     "namespace = sample_mod",
     "sample_mod.0001 = {",
     "  value = 10",
+    "  save_scope_as = scope:actor",
+    "  change_variable = { name = var:test value = medium_prestige_value }",
     "}",
     "",
   ].join("\n"));
@@ -32,6 +36,14 @@ test("buildSemanticTokens emits token data for script syntax", () => {
   const tokens = buildSemanticTokens(parsed);
   assert.ok(Array.isArray(tokens.data));
   assert.ok(tokens.data.length > 0);
+
+  const typeIndexes = [];
+  for (let index = 3; index < tokens.data.length; index += 5) {
+    typeIndexes.push(tokens.data[index]);
+  }
+  assert.ok(typeIndexes.includes(SEMANTIC_TOKEN_TYPES.indexOf("event")));
+  assert.ok(typeIndexes.includes(SEMANTIC_TOKEN_TYPES.indexOf("class")));
+  assert.ok(typeIndexes.includes(SEMANTIC_TOKEN_TYPES.indexOf("variable")));
 });
 
 test("buildRenameWorkspaceEdit rewrites symbols and references", () => {
@@ -84,6 +96,33 @@ test("createMissingLocalizationCodeAction inserts a loc stub", () => {
     assert.ok(action);
     assert.match(action.title, /missing_key/);
     assert.equal(Object.keys(action.edit.changes).length, 1);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("createMissingScriptDefinitionCodeAction creates a scripted effect stub", () => {
+  const tempRoot = fs.mkdtempSync(path.join(localTempRoot, "ck3-devkit-lsp-test-"));
+
+  try {
+    const effectFile = path.join(tempRoot, "zz_generated_effects.txt");
+    const action = createMissingScriptDefinitionCodeAction(
+      {
+        range: {
+          start: { line: 2, character: 10 },
+          end: { line: 2, character: 30 },
+        },
+        message: "Unresolved scripted_effect reference: sample_missing_effect",
+      },
+      "sample_missing_effect",
+      "scripted_effect",
+      effectFile
+    );
+
+    assert.ok(action);
+    assert.match(action.title, /sample_missing_effect/);
+    assert.ok(action.edit.documentChanges);
+    assert.equal(action.edit.documentChanges[0].kind, "create");
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
