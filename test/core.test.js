@@ -7,6 +7,7 @@ const path = require("node:path");
 const { buildCachedWorkspaceIndex } = require("../dist/cli-shared");
 const { parseScript } = require("../dist/core/parser");
 const { parseLocalization } = require("../dist/core/localization");
+const { incrementalParseScript, createIncrementalDocumentIndexRecord } = require("../dist/core/incremental");
 const { collectDocumentDiagnostics } = require("../dist/core/diagnostics");
 const { createWorkspaceIndex } = require("../dist/core/indexer");
 const { analyzeErrorLogText } = require("../dist/core/errorLog");
@@ -44,6 +45,288 @@ broken_event = {
 
   assert.equal(parsed.errors.length, 1);
   assert.match(parsed.errors[0].message, /Missing closing '\}'/);
+});
+
+test("incrementalParseScript reparses only the affected top-level entry", () => {
+  const previous = parseScript(`
+first_block = {
+  value = 1
+}
+
+second_block = {
+  value = old_key
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+first_block = {
+  value = 1
+}
+
+second_block = {
+  value = new_key
+}
+`);
+
+  assert.equal(next.kind, "script");
+  assert.equal(next.entries.length, 2);
+  assert.equal(next.entries[0].key, "first_block");
+  assert.equal(next.entries[1].key, "second_block");
+  assert.equal(next.entries[1].value.entries[0].value.value, "new_key");
+});
+
+test("createIncrementalDocumentIndexRecord reuses previous parsed scripts", () => {
+  const previous = parseScript(`
+sample_effect = {
+  add_gold = 10
+}
+`);
+
+  const record = createIncrementalDocumentIndexRecord(
+    "sample.txt",
+    `
+sample_effect = {
+  add_gold = 25
+}
+`,
+    "mod",
+    previous,
+  );
+
+  assert.equal(record.parsed.kind, "script");
+  assert.equal(record.symbols.some((symbol) => symbol.name === "sample_effect"), true);
+});
+
+test("incrementalParseScript handles inserted top-level entries", () => {
+  const previous = parseScript(`
+first_block = {
+  value = 1
+}
+
+third_block = {
+  value = 3
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+first_block = {
+  value = 1
+}
+
+second_block = {
+  value = 2
+}
+
+third_block = {
+  value = 3
+}
+`);
+
+  assert.equal(next.kind, "script");
+  assert.deepEqual(next.entries.map((entry) => entry.key), [
+    "first_block",
+    "second_block",
+    "third_block",
+  ]);
+});
+
+test("incrementalParseScript handles removed top-level entries", () => {
+  const previous = parseScript(`
+first_block = {
+  value = 1
+}
+
+second_block = {
+  value = 2
+}
+
+third_block = {
+  value = 3
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+first_block = {
+  value = 1
+}
+
+third_block = {
+  value = 3
+}
+`);
+
+  assert.equal(next.kind, "script");
+  assert.deepEqual(next.entries.map((entry) => entry.key), [
+    "first_block",
+    "third_block",
+  ]);
+});
+
+test("incrementalParseScript reparses nested object bodies without replacing sibling top-level entries", () => {
+  const previous = parseScript(`
+outer = {
+  inner = {
+    value = old_key
+  }
+}
+
+other = {
+  value = keep_me
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+outer = {
+  inner = {
+    value = new_key
+  }
+}
+
+other = {
+  value = keep_me
+}
+`);
+
+  assert.equal(next.kind, "script");
+  assert.equal(next.entries[0].key, "outer");
+  assert.equal(next.entries[1].key, "other");
+  assert.equal(
+    next.entries[0].value.entries[0].value.entries[0].value.value,
+    "new_key",
+  );
+  assert.equal(
+    next.entries[1].value.entries[0].value.value,
+    "keep_me",
+  );
+});
+
+test("incrementalParseScript handles inserted nested object entries", () => {
+  const previous = parseScript(`
+outer = {
+  inner = {
+    first = yes
+    third = yes
+  }
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+outer = {
+  inner = {
+    first = yes
+    second = yes
+    third = yes
+  }
+}
+`);
+
+  assert.equal(next.kind, "script");
+  const innerEntries = next.entries[0].value.entries[0].value.entries.map((entry) => entry.key);
+  assert.deepEqual(innerEntries, ["first", "second", "third"]);
+});
+
+test("incrementalParseScript handles removed nested object entries", () => {
+  const previous = parseScript(`
+outer = {
+  inner = {
+    first = yes
+    second = yes
+    third = yes
+  }
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+outer = {
+  inner = {
+    first = yes
+    third = yes
+  }
+}
+`);
+
+  assert.equal(next.kind, "script");
+  const innerEntries = next.entries[0].value.entries[0].value.entries.map((entry) => entry.key);
+  assert.deepEqual(innerEntries, ["first", "third"]);
+});
+
+test("incrementalParseScript handles inserted list items", () => {
+  const previous = parseScript(`
+outer = {
+  values = [ first third ]
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+outer = {
+  values = [ first second third ]
+}
+`);
+
+  assert.equal(next.kind, "script");
+  const items = next.entries[0].value.entries[0].value.items.map((item) => item.value);
+  assert.deepEqual(items, ["first", "second", "third"]);
+});
+
+test("incrementalParseScript handles removed list items", () => {
+  const previous = parseScript(`
+outer = {
+  values = [ first second third ]
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+outer = {
+  values = [ first third ]
+}
+`);
+
+  assert.equal(next.kind, "script");
+  const items = next.entries[0].value.entries[0].value.items.map((item) => item.value);
+  assert.deepEqual(items, ["first", "third"]);
+});
+
+test("incrementalParseScript updates nested scalar values without rebuilding siblings", () => {
+  const previous = parseScript(`
+outer = {
+  inner = {
+    value = old_key
+    keep = yes
+  }
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+outer = {
+  inner = {
+    value = new_key
+    keep = yes
+  }
+}
+`);
+
+  assert.equal(next.kind, "script");
+  const innerEntries = next.entries[0].value.entries[0].value.entries;
+  assert.equal(innerEntries[0].value.value, "new_key");
+  assert.equal(innerEntries[1].value.value, "yes");
+});
+
+test("incrementalParseScript updates nested scalar list items", () => {
+  const previous = parseScript(`
+outer = {
+  values = [ first second third ]
+}
+`);
+
+  const next = incrementalParseScript(previous, `
+outer = {
+  values = [ first changed third ]
+}
+`);
+
+  assert.equal(next.kind, "script");
+  const items = next.entries[0].value.entries[0].value.items.map((item) => item.value);
+  assert.deepEqual(items, ["first", "changed", "third"]);
 });
 
 test("parseLocalization extracts language and entries", () => {

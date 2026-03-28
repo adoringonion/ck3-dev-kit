@@ -8,6 +8,10 @@ export interface ReferenceValidationRecord extends DiagnosticRecord {
   referenceKind: string;
 }
 
+export interface ReferenceValidationOptions {
+  checkpoint?: () => void;
+}
+
 export function findReferences(index: WorkspaceIndex, name: string): ReferenceRecord[] {
   return index.references.get(name) ?? [];
 }
@@ -37,14 +41,19 @@ export function validateReferences(index: WorkspaceIndex, filePath?: string): Re
   return diagnostics;
 }
 
-export function validateParsedDocumentAgainstIndex(parsed: ParsedDocument, index: WorkspaceIndex): ReferenceValidationRecord[] {
-  return validateParsedReferencesAgainstIndex(parsed, collectParsedReferences(parsed), index);
+export function validateParsedDocumentAgainstIndex(
+  parsed: ParsedDocument,
+  index: WorkspaceIndex,
+  options?: ReferenceValidationOptions,
+): ReferenceValidationRecord[] {
+  return validateParsedReferencesAgainstIndex(parsed, collectParsedReferences(parsed), index, options);
 }
 
 export function validateParsedReferencesAgainstIndex(
   parsed: ParsedDocument,
   references: ReferenceRecord[],
-  index: WorkspaceIndex
+  index: WorkspaceIndex,
+  options?: ReferenceValidationOptions,
 ): ReferenceValidationRecord[] {
   const diagnostics: ReferenceValidationRecord[] = [];
   const seen = new Set<string>();
@@ -56,7 +65,11 @@ export function validateParsedReferencesAgainstIndex(
     });
   }
 
-  for (const reference of references) {
+  for (let indexRef = 0; indexRef < references.length; indexRef += 1) {
+    if (indexRef % 128 === 0) {
+      options?.checkpoint?.();
+    }
+    const reference = references[indexRef];
     if (hasMatchingDefinition(index, reference)) {
       continue;
     }

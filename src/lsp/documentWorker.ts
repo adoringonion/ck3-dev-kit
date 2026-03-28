@@ -1,11 +1,12 @@
 import { parentPort, workerData } from "worker_threads";
-import { createDocumentIndexRecord } from "../core/indexer";
+import { createIncrementalDocumentIndexRecord } from "../core/incremental";
 import { ParsedDocument, ReferenceRecord, SymbolRecord } from "../core/types";
 
 interface WorkerInput {
   filePath: string;
   text: string;
   source: "mod" | "reference";
+  previous?: ParsedDocument;
 }
 
 interface WorkerOutput {
@@ -16,7 +17,7 @@ interface WorkerOutput {
 
 try {
   const input = workerData as WorkerInput;
-  const record = createDocumentIndexRecord(input.filePath, input.text, input.source);
+  const record = createIncrementalDocumentIndexRecord(input.filePath, input.text, input.source, input.previous);
   const output: WorkerOutput = {
     parsed: record.parsed,
     symbols: record.symbols,

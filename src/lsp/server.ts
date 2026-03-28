@@ -1,4 +1,5 @@
 import {
+  CancellationToken,
   CodeAction,
   CompletionItem,
   CompletionParams,
@@ -64,17 +65,21 @@ import {
   IndexStatusPayload,
   REBUILD_INDEX_NOTIFICATION,
 } from "./protocol";
+import { cancellationFromAbortSignal, RequestCancelledError, RequestContext } from "./requestContext";
 import { ServerConfig, ServerSnapshot, ServerState, SourceKind } from "./serverState";
 
 const connection = createConnection();
 const documents = new TextDocuments(TextDocument);
 const state = new ServerState();
 let indexBuildPromise: Promise<void> | null = null;
+let indexBuildController: AbortController | null = null;
 const WORKSPACE_DIAGNOSTIC_IDLE_DELAY_MS = 15000;
 const WORKSPACE_DIAGNOSTIC_BATCH_BUDGET_MS = 4;
 const WORKSPACE_DIAGNOSTIC_BATCH_INTERVAL_MS = 250;
 const activeDocumentWorkers = new Map<string, { version: number; worker: Worker }>();
 const cancelledDocumentWorkers = new WeakSet<Worker>();
+const documentAnalysisControllers = new Map<string, AbortController>();
+let workspaceDiagnosticsController: AbortController | null = null;
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
   state.setConfig(normalizeConfig(params.initializationOptions));
@@ -115,12 +120,15 @@ connection.onInitialized(() => {
   }
 });
 
-connection.onHover(({ textDocument, position }): Hover | null => timeRequest("hover", () => {
+connection.onHover(({ textDocument, position }, token): Hover | null => timeRequest("hover", token, () => {
+  const context = new RequestContext({ label: "hover", token });
+  context.throwIfCancelled();
   const document = documents.get(textDocument.uri);
   if (!document) {
     return null;
   }
   const snapshot = state.snapshot();
+  context.throwIfCancelled();
 
   if (indexBuildPromise) {
     return indexingHover("CK3 Mod DevKit is building the symbol index. Hover, definition, and references will fill in when indexing completes.");
@@ -141,6 +149,7 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
 
   const parsed = currentParsedDocument(snapshot, document);
   const name = document.getText(wordRange);
+  context.throwIfCancelled();
   const syntaxHelp = parsed
     ? getScriptSyntaxHelp(name, parsed.kind === "script" ? syntaxHelpContextAt(parsed, wordRange) : undefined)
     : getScriptSyntaxHelp(name);
@@ -152,18 +161,20 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
       },
       range: wordRange,
     };
-    snapshot.setHoverCache(cacheKey, hover);
+    state.setHoverCache(cacheKey, hover);
     return hover;
   }
 
-  const definitions = snapshot.definitionSymbols(name);
+  const definitions = snapshot.definitionSymbols(name, context);
+  context.throwIfCancelled();
   const target = definitions[0];
   if (!target) {
-    snapshot.setHoverCache(cacheKey, null);
+    state.setHoverCache(cacheKey, null);
     return null;
   }
 
-  const referenceCount = snapshot.referencesByName(name).length;
+  const referenceCount = snapshot.referencesByName(name, context).length;
+  context.throwIfCancelled();
   const hover = {
     contents: {
       kind: MarkupKind.Markdown,
@@ -178,11 +189,13 @@ connection.onHover(({ textDocument, position }): Hover | null => timeRequest("ho
     },
     range: wordRange,
   };
-  snapshot.setHoverCache(cacheKey, hover);
+  state.setHoverCache(cacheKey, hover);
   return hover;
 }));
 
-connection.onDefinition(({ textDocument, position }): Definition | null => timeRequest("definition", () => {
+connection.onDefinition(({ textDocument, position }, token): Definition | null => timeRequest("definition", token, () => {
+  const context = new RequestContext({ label: "definition", token });
+  context.throwIfCancelled();
   const document = documents.get(textDocument.uri);
   const snapshot = state.snapshot();
   if (!document || indexBuildPromise || !snapshot.isIndexReady()) {
@@ -194,14 +207,17 @@ connection.onDefinition(({ textDocument, position }): Definition | null => timeR
   }
 
   const name = document.getText(wordRange);
-  const relevant = snapshot.definitionSymbols(name);
+  context.throwIfCancelled();
+  const relevant = snapshot.definitionSymbols(name, context);
   if (relevant.length === 0) {
     return null;
   }
   return relevant.map(toLocation);
 }));
 
-connection.onReferences(({ textDocument, position }: ReferenceParams): Location[] | null => timeRequest("references", () => {
+connection.onReferences(({ textDocument, position }: ReferenceParams, token): Location[] | null => timeRequest("references", token, () => {
+  const context = new RequestContext({ label: "references", token });
+  context.throwIfCancelled();
   const document = documents.get(textDocument.uri);
   const snapshot = state.snapshot();
   if (!document || indexBuildPromise || !snapshot.isIndexReady()) {
@@ -212,10 +228,13 @@ connection.onReferences(({ textDocument, position }: ReferenceParams): Location[
     return null;
   }
   const name = document.getText(wordRange);
-  return snapshot.referencesByName(name).map(toReferenceLocation);
+  context.throwIfCancelled();
+  return snapshot.referencesByName(name, context).map(toReferenceLocation);
 }));
 
-connection.onCompletion(({ textDocument, position }: CompletionParams): CompletionItem[] | null => timeRequest("completion", () => {
+connection.onCompletion(({ textDocument, position }: CompletionParams, token): CompletionItem[] | null => timeRequest("completion", token, () => {
+  const request = new RequestContext({ label: "completion", token });
+  request.throwIfCancelled();
   const document = documents.get(textDocument.uri);
   if (!document) {
     return null;
@@ -225,14 +244,15 @@ connection.onCompletion(({ textDocument, position }: CompletionParams): Completi
   const lines = document.getText().split(/\r?\n/);
   const currentLine = lines[position.line] ?? "";
   const linePrefix = currentLine.slice(0, position.character);
-  const context = inferCompletionContext(linePrefix, recentDocumentText(document, position));
-  if (!context) {
+  const completionContext = inferCompletionContext(linePrefix, recentDocumentText(document, position));
+  if (!completionContext) {
     return null;
   }
 
-  const symbols = snapshot.completionSymbols(context.kinds, context.query);
+  request.throwIfCancelled();
+  const symbols = snapshot.completionSymbols(completionContext.kinds, completionContext.query, 100, request);
   return symbols.map((symbol) => ({
-    label: context.prefix ? `${context.prefix}${symbol.name}` : symbol.name,
+    label: completionContext.prefix ? `${completionContext.prefix}${symbol.name}` : symbol.name,
     kind: toCompletionItemKind(symbol.kind),
     detail: `${symbol.kind} (${symbol.source})`,
     documentation: {
@@ -241,7 +261,7 @@ connection.onCompletion(({ textDocument, position }: CompletionParams): Completi
     },
     textEdit: {
       range: findWordRange(document, position) ?? { start: position, end: position },
-      newText: context.prefix ? `${context.prefix}${symbol.name}` : symbol.name,
+      newText: completionContext.prefix ? `${completionContext.prefix}${symbol.name}` : symbol.name,
     },
     sortText: `${symbol.source === "mod" ? "0" : "1"}-${symbol.name}`,
   }));
@@ -278,7 +298,8 @@ connection.onDocumentSymbol(({ textDocument }) => {
 });
 
 connection.onWorkspaceSymbol(({ query }: WorkspaceSymbolParams): SymbolInformation[] => {
-  return state.snapshot().workspaceSymbols(query)
+  const context = new RequestContext({ label: "workspaceSymbol" });
+  return state.snapshot().workspaceSymbols(query, context)
     .map((symbol) => toWorkspaceSymbol(symbol) as SymbolInformation);
 });
 
@@ -293,8 +314,9 @@ connection.onPrepareRename(({ textDocument, position }: PrepareRenameParams) => 
   }
   const name = document.getText(wordRange);
   const snapshot = state.snapshot();
-  const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name);
-  const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name));
+  const context = new RequestContext({ label: "prepareRename" });
+  const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name, context);
+  const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name, context));
   if (!target) {
     return null;
   }
@@ -315,26 +337,30 @@ connection.onRenameRequest(({ textDocument, position, newName }: RenameParams): 
   }
   const name = document.getText(wordRange);
   const snapshot = state.snapshot();
-  const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name);
-  const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name));
+  const context = new RequestContext({ label: "rename" });
+  const candidate = targetRenameCandidate(snapshot, document.uri, wordRange, name, context);
+  const target = resolveModRenameTarget(candidate, snapshot.symbolsByName(name, context));
   if (!target) {
     return null;
   }
-  const symbols = filterModRenameSymbols(snapshot.symbolsByName(name), target);
-  const references = filterModRenameReferences(snapshot.referencesByName(name), target);
+  const symbols = filterModRenameSymbols(snapshot.symbolsByName(name, context), target);
+  const references = filterModRenameReferences(snapshot.referencesByName(name, context), target);
   if (symbols.length === 0 && references.length === 0) {
     return null;
   }
   return buildRenameWorkspaceEdit(newName, symbols, references);
 });
 
-connection.onCodeAction((params): CodeAction[] => timeRequest("codeAction", () => {
+connection.onCodeAction((params, token): CodeAction[] => timeRequest("codeAction", token, () => {
+  const context = new RequestContext({ label: "codeAction", token });
+  context.throwIfCancelled();
   if (!params.context.diagnostics.some(isActionableDiagnostic)) {
     return [];
   }
   const actions: CodeAction[] = [];
   const document = documents.get(params.textDocument.uri);
   for (const diagnostic of params.context.diagnostics) {
+    context.throwIfCancelled();
     if (diagnostic.message === "Localization files should be saved as UTF-8 with BOM.") {
       actions.push(createAddUtf8BomCodeAction(diagnostic, params.textDocument.uri));
       continue;
@@ -392,7 +418,9 @@ connection.onCodeAction((params): CodeAction[] => timeRequest("codeAction", () =
   return actions;
 }));
 
-connection.languages.inlayHint.on(({ textDocument }): InlayHint[] => timeRequest("inlayHint", () => {
+connection.languages.inlayHint.on(({ textDocument }, token): InlayHint[] => timeRequest("inlayHint", token, () => {
+  const context = new RequestContext({ label: "inlayHint", token });
+  context.throwIfCancelled();
   const document = documents.get(textDocument.uri);
   if (!document) {
     return [];
@@ -406,12 +434,15 @@ connection.languages.inlayHint.on(({ textDocument }): InlayHint[] => timeRequest
   if (!parsed) {
     return [];
   }
-  const hints = buildInlayHints(parsed, uriToFsPath(document.uri), snapshot.allSymbols());
-  snapshot.setInlayHintCache(document.uri, document.version, hints);
+  const hints = buildInlayHints(parsed, uriToFsPath(document.uri), snapshot.allSymbols(undefined, context));
+  context.throwIfCancelled();
+  state.setInlayHintCache(document.uri, document.version, hints);
   return hints;
 }));
 
-connection.languages.semanticTokens.on(({ textDocument }): SemanticTokens => timeRequest("semanticTokens", () => {
+connection.languages.semanticTokens.on(({ textDocument }, token): SemanticTokens => timeRequest("semanticTokens", token, () => {
+  const context = new RequestContext({ label: "semanticTokens", token });
+  context.throwIfCancelled();
   const document = documents.get(textDocument.uri);
   if (!document) {
     return { data: [] };
@@ -426,7 +457,8 @@ connection.languages.semanticTokens.on(({ textDocument }): SemanticTokens => tim
     return { data: [] };
   }
   const tokens = buildSemanticTokens(parsed);
-  snapshot.setSemanticTokenCache(document.uri, document.version, tokens);
+  context.throwIfCancelled();
+  state.setSemanticTokenCache(document.uri, document.version, tokens);
   return tokens;
 }));
 
@@ -463,6 +495,7 @@ documents.onDidChangeContent((event) => {
 
 documents.onDidClose((event) => {
   cancelDocumentWorker(event.document.uri);
+  cancelDocumentAnalysisContext(event.document.uri);
   state.cancelDocumentAnalysis(event.document.uri);
   state.cancelDocumentDiagnostics(event.document.uri);
   clearHoverCacheForUri(event.document.uri);
@@ -491,32 +524,53 @@ function normalizeConfig(value: unknown): ServerConfig {
 async function rebuildIndex(reason: string): Promise<void> {
   if (indexBuildPromise) {
     sendIndexStatus({ phase: "busy", reason });
-    await indexBuildPromise;
-    return;
+    indexBuildController?.abort();
+    try {
+      await indexBuildPromise;
+    } catch {
+      // The previous build was intentionally cancelled by a newer request.
+    }
   }
 
   indexBuildPromise = (async () => {
+    const controller = new AbortController();
+    indexBuildController = controller;
     const progress = await connection.window.createWorkDoneProgress();
+    const context = new RequestContext({
+      label: `rebuild index (${reason})`,
+      token: cancellationFromAbortSignal(controller.signal),
+      progress,
+    });
     sendIndexStatus({ phase: "started", reason });
     progress.begin("CK3 Mod DevKit", undefined, `Building symbol index (${reason})`, false);
     state.markIndexRebuilding();
     cancelAllDocumentWorkers();
+    cancelAllDocumentAnalysisContexts();
+    cancelWorkspaceDiagnosticsContext();
     try {
-      const nextIndex = await buildIndexInWorker(state.getConfig());
+      context.checkpoint("Collecting workspace files");
+      context.report("Collecting workspace files");
+      const nextIndex = await buildIndexInWorker(state.getConfig(), controller.signal);
+      context.throwIfCancelled();
+      context.checkpoint("Applying immutable workspace snapshot");
       state.setIndex(nextIndex);
-      progress.report("Syncing open documents");
+      context.report("Syncing open documents");
       sendIndexStatus({ phase: "completed", reason });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       state.markIndexFailed(message);
-      progress.report("Index build failed");
+      context.report("Index build failed");
       sendIndexStatus({ phase: "failed", reason, message });
       throw error;
     } finally {
       progress.done();
+      if (indexBuildController === controller) {
+        indexBuildController = null;
+      }
       indexBuildPromise = null;
     }
 
+    context.throwIfCancelled();
     for (const document of documents.all()) {
       state.openDocument(document);
       if (!state.hasCurrentAnalysis(document)) {
@@ -531,7 +585,8 @@ async function rebuildIndex(reason: string): Promise<void> {
 }
 
 function publishDiagnostics(document: TextDocument): void {
-  const diagnostics = timeRequest("publishDiagnostics", () => state.collectDocumentDiagnostics(document));
+  const context = new RequestContext({ label: "publishDiagnostics" });
+  const diagnostics = timeRequest<Diagnostic[]>("publishDiagnostics", undefined, () => state.collectDocumentDiagnostics(document, context));
   connection.sendDiagnostics({
     uri: document.uri,
     diagnostics,
@@ -545,8 +600,22 @@ function scheduleDiagnostics(document: TextDocument, delayMs: number): void {
 }
 
 function scheduleAnalysis(document: TextDocument, delayMs: number): void {
+  cancelDocumentAnalysisContext(document.uri);
+  const controller = new AbortController();
+  documentAnalysisControllers.set(document.uri, controller);
   state.scheduleDocumentAnalysis(document.uri, delayMs, () => {
-    void analyzeDocumentInWorker(document).catch((error) => {
+    const latestController = documentAnalysisControllers.get(document.uri);
+    if (!latestController || latestController !== controller || controller.signal.aborted) {
+      return;
+    }
+    const context = new RequestContext({
+      label: `document analysis ${document.uri}`,
+      token: cancellationFromAbortSignal(controller.signal),
+    });
+    void analyzeDocumentInWorker(document, context).catch((error) => {
+      if (controller.signal.aborted) {
+        return;
+      }
       connection.console.error(`[analysis] ${document.uri}: ${error instanceof Error ? error.message : String(error)}`);
     });
   });
@@ -556,17 +625,30 @@ function clearHoverCacheForUri(uri: string): void {
   state.clearHoverCacheForUri(uri);
 }
 
-function scheduleWorkspaceDiagnostics(): void {
+async function scheduleWorkspaceDiagnostics(): Promise<void> {
+  cancelWorkspaceDiagnosticsContext();
+  const controller = new AbortController();
+  workspaceDiagnosticsController = controller;
+  const progress = await connection.window.createWorkDoneProgress();
+  const context = new RequestContext({
+    label: "workspace diagnostics",
+    token: cancellationFromAbortSignal(controller.signal),
+    progress,
+  });
+  progress.begin("CK3 Mod DevKit", undefined, "Running workspace diagnostics", true);
   const entries = Array.from(state.getIndex().documents.entries())
     .filter(([filePath]) => state.resolveSource(filePath) === "mod")
     .map(([filePath, parsed]) => ({ filePath, parsed }));
   state.scheduleWorkspaceDiagnostics(entries, ({ filePath, parsed }) => {
+      if (context.token?.isCancellationRequested) {
+        return;
+      }
       const uri = pathToFileURL(filePath).toString();
       if (documents.get(uri)) {
         return;
       }
 
-      const diagnostics = state.collectIndexedDiagnostics(filePath, parsed);
+      const diagnostics = state.collectIndexedDiagnostics(filePath, parsed, context);
       connection.sendDiagnostics({
         uri,
         diagnostics,
@@ -575,16 +657,38 @@ function scheduleWorkspaceDiagnostics(): void {
       initialDelayMs: WORKSPACE_DIAGNOSTIC_IDLE_DELAY_MS,
       batchBudgetMs: WORKSPACE_DIAGNOSTIC_BATCH_BUDGET_MS,
       batchIntervalMs: WORKSPACE_DIAGNOSTIC_BATCH_INTERVAL_MS,
+      isCancelled: () => context.token?.isCancellationRequested ?? false,
+      onProgress: (processed, total) => {
+        if (context.token?.isCancellationRequested) {
+          return;
+        }
+        if (processed >= total) {
+          progress.done();
+          if (workspaceDiagnosticsController === controller) {
+            workspaceDiagnosticsController = null;
+          }
+          return;
+        }
+        const percentage = total > 0 ? Math.round((processed / total) * 100) : 100;
+        context.report(`Workspace diagnostics ${processed}/${total}`);
+        progress.report(percentage, `Workspace diagnostics ${processed}/${total}`);
+      },
     });
 }
 
 function rescheduleWorkspaceDiagnostics(): void {
   state.cancelWorkspaceDiagnostics();
-  scheduleWorkspaceDiagnostics();
+  void scheduleWorkspaceDiagnostics();
 }
 
-function targetRenameCandidate(snapshot: ServerSnapshot, documentUri: string, range: Range, name: string): { kind: string; source: SourceKind } | null {
-  const candidate = snapshot.renameCandidate(documentUri, range.start, name);
+function targetRenameCandidate(
+  snapshot: ServerSnapshot,
+  documentUri: string,
+  range: Range,
+  name: string,
+  context?: RequestContext,
+): { kind: string; source: SourceKind } | null {
+  const candidate = snapshot.renameCandidate(documentUri, range.start, name, context);
   if (!candidate) {
     return null;
   }
@@ -703,10 +807,18 @@ function sendIndexStatus(payload: IndexStatusPayload): void {
   connection.sendNotification(INDEX_STATUS_NOTIFICATION, payload);
 }
 
-function timeRequest<T>(label: string, fn: () => T): T {
+function timeRequest<T>(label: string, token: CancellationToken | undefined, fn: () => T): T {
   const started = Date.now();
   try {
+    if (token?.isCancellationRequested) {
+      throw new RequestCancelledError(`${label} cancelled.`);
+    }
     return fn();
+  } catch (error) {
+    if (error instanceof RequestCancelledError) {
+      return null as T;
+    }
+    throw error;
   } finally {
     const elapsed = Date.now() - started;
     if (elapsed >= 50) {
@@ -715,12 +827,23 @@ function timeRequest<T>(label: string, fn: () => T): T {
   }
 }
 
-async function buildIndexInWorker(currentConfig: ServerConfig): Promise<WorkspaceIndex> {
+async function buildIndexInWorker(currentConfig: ServerConfig, signal?: AbortSignal): Promise<WorkspaceIndex> {
   const workerPath = path.join(__dirname, "indexWorker.js");
   return new Promise((resolve, reject) => {
     const worker = new Worker(workerPath, {
       workerData: currentConfig,
     });
+    const abort = () => {
+      worker.terminate().catch(() => undefined);
+      reject(new RequestCancelledError("index build cancelled."));
+    };
+
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+
+    signal?.addEventListener("abort", abort, { once: true });
 
     worker.once("message", (message: {
       ok: boolean;
@@ -732,6 +855,7 @@ async function buildIndexInWorker(currentConfig: ServerConfig): Promise<Workspac
       };
       error?: string;
     }) => {
+      signal?.removeEventListener("abort", abort);
       worker.terminate().catch(() => undefined);
       if (!message.ok || !message.index) {
         reject(new Error(message.error ?? "Unknown index worker failure."));
@@ -746,11 +870,16 @@ async function buildIndexInWorker(currentConfig: ServerConfig): Promise<Workspac
     });
 
     worker.once("error", (error) => {
+      signal?.removeEventListener("abort", abort);
       worker.terminate().catch(() => undefined);
       reject(error);
     });
 
     worker.once("exit", (code) => {
+      signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) {
+        return;
+      }
       if (code !== 0) {
         reject(new Error(`Index worker exited with code ${code}.`));
       }
@@ -758,7 +887,8 @@ async function buildIndexInWorker(currentConfig: ServerConfig): Promise<Workspac
   });
 }
 
-async function analyzeDocumentInWorker(document: TextDocument): Promise<void> {
+async function analyzeDocumentInWorker(document: TextDocument, context: RequestContext): Promise<void> {
+  context.throwIfCancelled();
   const current = documents.get(document.uri);
   if (!current) {
     return;
@@ -766,22 +896,40 @@ async function analyzeDocumentInWorker(document: TextDocument): Promise<void> {
   const version = current.version;
   const filePath = uriToFsPath(current.uri);
   const source = state.resolveSource(filePath);
+  const previous = state.getAnalysisBaseParsed(document.uri, filePath);
   const workerPath = path.join(__dirname, "documentWorker.js");
+  context.report(`Analyzing ${path.basename(filePath)}`);
 
   const result = await new Promise<{
     parsed: ParsedDocument;
     symbols: SymbolRecord[];
     references: ReferenceRecord[];
   }>((resolve, reject) => {
+    let unsubscribeCancellation: (() => void) | { dispose(): void } | undefined;
+    const abort = () => {
+      if (typeof unsubscribeCancellation === "function") {
+        unsubscribeCancellation();
+      } else {
+        unsubscribeCancellation?.dispose();
+      }
+      cancelDocumentWorker(document.uri);
+      reject(new RequestCancelledError(`document analysis cancelled: ${document.uri}`));
+    };
+    if (context.token?.isCancellationRequested) {
+      abort();
+      return;
+    }
     cancelStaleDocumentWorker(document.uri, version);
     const worker = new Worker(workerPath, {
       workerData: {
         filePath,
         text: current.getText(),
         source,
+        previous,
       },
     });
     activeDocumentWorkers.set(document.uri, { version, worker });
+    unsubscribeCancellation = context.token?.onCancellationRequested?.(abort);
 
     worker.once("message", (message: {
       ok: boolean;
@@ -792,6 +940,11 @@ async function analyzeDocumentInWorker(document: TextDocument): Promise<void> {
       };
       error?: string;
     }) => {
+      if (typeof unsubscribeCancellation === "function") {
+        unsubscribeCancellation();
+      } else {
+        unsubscribeCancellation?.dispose();
+      }
       clearDocumentWorker(document.uri, version, worker);
       worker.terminate().catch(() => undefined);
       if (!message.ok || !message.record) {
@@ -802,6 +955,11 @@ async function analyzeDocumentInWorker(document: TextDocument): Promise<void> {
     });
 
     worker.once("error", (error) => {
+      if (typeof unsubscribeCancellation === "function") {
+        unsubscribeCancellation();
+      } else {
+        unsubscribeCancellation?.dispose();
+      }
       clearDocumentWorker(document.uri, version, worker);
       if (cancelledDocumentWorkers.has(worker)) {
         return;
@@ -811,6 +969,11 @@ async function analyzeDocumentInWorker(document: TextDocument): Promise<void> {
     });
 
     worker.once("exit", (code) => {
+      if (typeof unsubscribeCancellation === "function") {
+        unsubscribeCancellation();
+      } else {
+        unsubscribeCancellation?.dispose();
+      }
       clearDocumentWorker(document.uri, version, worker);
       if (cancelledDocumentWorkers.has(worker)) {
         return;
@@ -826,6 +989,8 @@ async function analyzeDocumentInWorker(document: TextDocument): Promise<void> {
     return;
   }
 
+  context.throwIfCancelled();
+  context.checkpoint(`Applying analysis for ${path.basename(filePath)}`);
   state.applyAnalyzedDocument(document.uri, version, source, result.parsed, result.symbols, result.references);
   scheduleDiagnostics(latest, 50);
 }
@@ -859,6 +1024,30 @@ function cancelAllDocumentWorkers(): void {
     cancelledDocumentWorkers.add(active.worker);
     active.worker.terminate().catch(() => undefined);
   }
+}
+
+function cancelDocumentAnalysisContext(uri: string): void {
+  const controller = documentAnalysisControllers.get(uri);
+  if (!controller) {
+    return;
+  }
+  documentAnalysisControllers.delete(uri);
+  controller.abort();
+}
+
+function cancelAllDocumentAnalysisContexts(): void {
+  for (const [uri, controller] of documentAnalysisControllers.entries()) {
+    documentAnalysisControllers.delete(uri);
+    controller.abort();
+  }
+}
+
+function cancelWorkspaceDiagnosticsContext(): void {
+  if (!workspaceDiagnosticsController) {
+    return;
+  }
+  workspaceDiagnosticsController.abort();
+  workspaceDiagnosticsController = null;
 }
 
 function clearDocumentWorker(uri: string, version: number, worker: Worker): void {

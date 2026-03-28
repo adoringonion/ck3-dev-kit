@@ -22,6 +22,10 @@ const {
   filterModRenameSymbols,
   resolveModRenameTarget,
 } = require("../dist/lsp/rename");
+const { QueryEngine } = require("../dist/lsp/queryEngine");
+const { RequestContext, RequestCancelledError, cancellationFromAbortSignal } = require("../dist/lsp/requestContext");
+const { ServerState } = require("../dist/lsp/serverState");
+const { TextDocument } = require("vscode-languageserver-textdocument");
 
 const localTempRoot = path.join(os.tmpdir(), "ck3-devkit-lsp-test");
 fs.mkdirSync(localTempRoot, { recursive: true });
@@ -375,4 +379,130 @@ test("rename filtering stays inside mod files", () => {
   assert.equal(references.length, 1);
   assert.match(symbols[0].path, /sample_l_english/);
   assert.match(references[0].path, /sample\.txt/);
+});
+
+test("QueryEngine invalidates tagged queries without clearing unrelated values", () => {
+  const engine = new QueryEngine();
+  let derivedSymbolsRuns = 0;
+  let derivedReferencesRuns = 0;
+  let symbolsByNameRuns = 0;
+
+  const readSymbols = () => engine.evaluate(
+    "symbolsByName:sample_key",
+    () => {
+      symbolsByNameRuns += 1;
+      return engine.evaluate(
+        "derivedSymbols",
+        () => {
+          derivedSymbolsRuns += 1;
+          return { sample_key: ["sample_key"] };
+        },
+        ["live:symbols"],
+      ).sample_key;
+    },
+    ["symbol:sample_key"],
+  );
+
+  const readReferences = () => engine.evaluate(
+    "referencesByName:sample_key",
+    () => engine.evaluate(
+      "derivedReferences",
+      () => {
+        derivedReferencesRuns += 1;
+        return { sample_key: ["sample_key"] };
+      },
+      ["live:references"],
+    ).sample_key,
+    ["reference:sample_key"],
+  );
+
+  assert.deepEqual(readSymbols(), ["sample_key"]);
+  assert.deepEqual(readReferences(), ["sample_key"]);
+  assert.equal(derivedSymbolsRuns, 1);
+  assert.equal(derivedReferencesRuns, 1);
+  assert.equal(symbolsByNameRuns, 1);
+
+  engine.markDirtyTag("live:symbols");
+
+  assert.deepEqual(readSymbols(), ["sample_key"]);
+  assert.deepEqual(readReferences(), ["sample_key"]);
+  assert.equal(derivedSymbolsRuns, 2);
+  assert.equal(derivedReferencesRuns, 1);
+  assert.equal(symbolsByNameRuns, 2);
+});
+
+test("RequestContext treats AbortSignal as a cancellation token", () => {
+  const controller = new AbortController();
+  const context = new RequestContext({
+    label: "background analysis",
+    token: cancellationFromAbortSignal(controller.signal),
+  });
+
+  context.checkpoint();
+  controller.abort();
+
+  assert.throws(() => context.throwIfCancelled(), RequestCancelledError);
+});
+
+test("QueryEngine invalidates dependent queries transitively", () => {
+  const engine = new QueryEngine();
+  let parentRuns = 0;
+  let leafRuns = 0;
+
+  const evaluateParent = () => engine.evaluate(
+    "parent",
+    () => {
+      parentRuns += 1;
+      return engine.evaluate(
+        "leaf",
+        () => {
+          leafRuns += 1;
+          return `leaf-${leafRuns}`;
+        },
+        ["leaf"],
+      );
+    },
+    ["parent"],
+  );
+
+  assert.equal(evaluateParent(), "leaf-1");
+  assert.equal(evaluateParent(), "leaf-1");
+  assert.equal(parentRuns, 1);
+  assert.equal(leafRuns, 1);
+
+  engine.markDirtyTag("leaf");
+
+  assert.equal(evaluateParent(), "leaf-2");
+  assert.equal(parentRuns, 2);
+  assert.equal(leafRuns, 2);
+});
+
+test("ServerSnapshot keeps a fixed symbol view after live state changes", () => {
+  const state = new ServerState();
+  state.setConfig({
+    modRoots: ["D:/mod"],
+    referenceRoots: [],
+    maxFiles: 1000,
+  });
+
+  const first = TextDocument.create(
+    "file:///D:/mod/events/sample.txt",
+    "ck3-script",
+    1,
+    "first_effect = {\n  value = yes\n}\n",
+  );
+  state.setLiveDocument(first, "mod");
+  const snapshot = state.snapshot();
+
+  const second = TextDocument.create(
+    "file:///D:/mod/events/sample.txt",
+    "ck3-script",
+    2,
+    "second_effect = {\n  value = yes\n}\n",
+  );
+  state.setLiveDocument(second, "mod");
+
+  assert.equal(snapshot.symbolsByName("first_effect").length, 1);
+  assert.equal(snapshot.symbolsByName("second_effect").length, 0);
+  assert.equal(state.snapshot().symbolsByName("second_effect").length, 1);
 });

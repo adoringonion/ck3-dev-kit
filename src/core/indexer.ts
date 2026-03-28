@@ -151,6 +151,14 @@ export function createWorkspaceIndexFromCollectedFiles(
 
 export function createDocumentIndexRecord(filePath: string, text: string, source: "mod" | "reference") {
   const parsed = parseDocumentText(filePath, text);
+  return createDocumentIndexRecordFromParsed(filePath, parsed, source);
+}
+
+export function createDocumentIndexRecordFromParsed(
+  filePath: string,
+  parsed: ParsedDocument,
+  source: "mod" | "reference",
+) {
   return {
     parsed,
     symbols: extractSymbols(filePath, parsed, source),

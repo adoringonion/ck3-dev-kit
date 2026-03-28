@@ -1,22 +1,13 @@
-import { AssignmentNode, ListNode, ObjectNode, ParserError, Range, ScalarNode, ScriptDocument, ValueNode } from "./types";
+import { AssignmentNode, ListNode, ObjectNode, ParserError, Range, ScalarNode, ScriptDocument, ScriptToken, TokenKind, ValueNode } from "./types";
 import { TextCursor } from "./text";
-
-type TokenKind = "identifier" | "string" | "number" | "operator" | "brace" | "bracket";
-
-interface Token {
-  kind: TokenKind;
-  value: string;
-  start: number;
-  end: number;
-}
 
 class Scanner {
   private index = 0;
 
   constructor(private readonly text: string) {}
 
-  scan(): Token[] {
-    const tokens: Token[] = [];
+  scan(): ScriptToken[] {
+    const tokens: ScriptToken[] = [];
 
     while (this.index < this.text.length) {
       const current = this.text[this.index];
@@ -76,7 +67,7 @@ class Scanner {
     return tokens;
   }
 
-  private scanString(): Token {
+  private scanString(): ScriptToken {
     const start = this.index;
     this.index += 1;
     while (this.index < this.text.length) {
@@ -99,7 +90,7 @@ class Scanner {
     };
   }
 
-  private scanNumberOrIdentifier(): Token {
+  private scanNumberOrIdentifier(): ScriptToken {
     const start = this.index;
     while (this.index < this.text.length && /[A-Za-z0-9_.:-]/.test(this.text[this.index])) {
       this.index += 1;
@@ -109,7 +100,7 @@ class Scanner {
     return { kind, value, start, end: this.index };
   }
 
-  private scanIdentifier(): Token {
+  private scanIdentifier(): ScriptToken {
     const start = this.index;
     while (this.index < this.text.length && /[A-Za-z0-9_:.@/-]/.test(this.text[this.index])) {
       this.index += 1;
@@ -130,7 +121,7 @@ class Parser {
   private index = 0;
   readonly errors: ParserError[] = [];
 
-  constructor(private readonly tokens: Token[], private readonly cursor: TextCursor) {}
+  constructor(private readonly tokens: ScriptToken[], private readonly cursor: TextCursor) {}
 
   parseDocument(text: string): ScriptDocument {
     const entries = this.parseAssignmentsUntil();
@@ -141,6 +132,7 @@ class Parser {
       range: this.cursor.range(0, end),
       errors: this.errors,
       text,
+      tokens: [...this.tokens],
     };
   }
 
@@ -261,7 +253,7 @@ class Parser {
     };
   }
 
-  private scalarFromToken(token: Token): ScalarNode {
+  private scalarFromToken(token: ScriptToken): ScalarNode {
     const kind = token.kind === "string" || token.kind === "number" || token.kind === "identifier" || token.kind === "operator"
       ? token.kind
       : "identifier";
@@ -272,7 +264,7 @@ class Parser {
     };
   }
 
-  private consume(value: string): Token {
+  private consume(value: string): ScriptToken {
     const token = this.peek();
     if (!token || token.value !== value) {
       throw new Error(`Expected token '${value}'.`);
@@ -281,7 +273,7 @@ class Parser {
     return token;
   }
 
-  private peek(offset = 0): Token | undefined {
+  private peek(offset = 0): ScriptToken | undefined {
     return this.tokens[this.index + offset];
   }
 
@@ -291,10 +283,180 @@ class Parser {
 }
 
 export function parseScript(text: string): ScriptDocument {
+  return parseScriptFromTokens(text, scanTokens(text));
+}
+
+export function parseScriptFromTokens(text: string, tokens: ScriptToken[]): ScriptDocument {
   const cursor = new TextCursor(text);
-  const scanner = new Scanner(text);
-  const parser = new Parser(scanner.scan(), cursor);
+  const parser = new Parser(tokens, cursor);
   return parser.parseDocument(text);
+}
+
+export function scanTokens(text: string): ScriptToken[] {
+  return new Scanner(text).scan();
+}
+
+export function parseScriptEntries(text: string): Pick<ScriptDocument, "entries" | "errors" | "range" | "text"> {
+  return parseScript(text);
+}
+
+export function parseScriptEntriesFromTokens(
+  text: string,
+  tokens: ScriptToken[],
+): Pick<ScriptDocument, "entries" | "errors" | "range" | "text"> {
+  return parseScriptFromTokens(text, tokens);
+}
+
+export function parseListItems(text: string): {
+  items: ValueNode[];
+  errors: ParserError[];
+  range: Range;
+  text: string;
+} {
+  const wrapped = `__list__ = [${text}]`;
+  const parsed = parseScript(wrapped);
+  const entry = parsed.entries[0];
+  if (!entry || entry.value.kind !== "list") {
+    return {
+      items: [],
+      errors: parsed.errors,
+      range: parsed.range,
+      text,
+    };
+  }
+  return {
+    items: entry.value.items,
+    errors: parsed.errors,
+    range: entry.value.range,
+    text,
+  };
+}
+
+export function parseListItemsFromTokens(text: string, tokens: ScriptToken[]): {
+  items: ValueNode[];
+  errors: ParserError[];
+  range: Range;
+  text: string;
+} {
+  const wrapped = `__list__ = [${text}]`;
+  const innerOffset = "__list__ = [".length;
+  const wrappedTokens: ScriptToken[] = [
+    { kind: "identifier", value: "__list__", start: 0, end: 8 },
+    { kind: "operator", value: "=", start: 9, end: 10 },
+    { kind: "bracket", value: "[", start: 11, end: 12 },
+    ...tokens.map((token) => ({
+      ...token,
+      start: token.start + innerOffset,
+      end: token.end + innerOffset,
+    })),
+    { kind: "bracket", value: "]", start: innerOffset + text.length, end: innerOffset + text.length + 1 },
+  ];
+  const parsed = parseScriptFromTokens(wrapped, wrappedTokens);
+  const entry = parsed.entries[0];
+  if (!entry || entry.value.kind !== "list") {
+    return {
+      items: [],
+      errors: parsed.errors,
+      range: parsed.range,
+      text,
+    };
+  }
+  return {
+    items: entry.value.items,
+    errors: parsed.errors,
+    range: entry.value.range,
+    text,
+  };
+}
+
+export function parseSingleValue(text: string): {
+  value: ValueNode | null;
+  errors: ParserError[];
+  range: Range;
+  text: string;
+} {
+  const wrapped = `__value__ = ${text}`;
+  const parsed = parseScript(wrapped);
+  const entry = parsed.entries[0];
+  if (!entry) {
+    return {
+      value: null,
+      errors: parsed.errors,
+      range: parsed.range,
+      text,
+    };
+  }
+  return {
+    value: entry.value,
+    errors: parsed.errors,
+    range: entry.value.range,
+    text,
+  };
+}
+
+export function parseSingleValueFromTokens(text: string, tokens: ScriptToken[]): {
+  value: ValueNode | null;
+  errors: ParserError[];
+  range: Range;
+  text: string;
+} {
+  const wrapped = `__value__ = ${text}`;
+  const valueOffset = "__value__ = ".length;
+  const wrappedTokens: ScriptToken[] = [
+    { kind: "identifier", value: "__value__", start: 0, end: 9 },
+    { kind: "operator", value: "=", start: 10, end: 11 },
+    ...tokens.map((token) => ({
+      ...token,
+      start: token.start + valueOffset,
+      end: token.end + valueOffset,
+    })),
+  ];
+  const parsed = parseScriptFromTokens(wrapped, wrappedTokens);
+  const entry = parsed.entries[0];
+  if (!entry) {
+    return {
+      value: null,
+      errors: parsed.errors,
+      range: parsed.range,
+      text,
+    };
+  }
+  return {
+    value: entry.value,
+    errors: parsed.errors,
+    range: entry.value.range,
+    text,
+  };
+}
+
+export function parseSingleAssignment(text: string): {
+  entry: AssignmentNode | null;
+  errors: ParserError[];
+  range: Range;
+  text: string;
+} {
+  const parsed = parseScript(text);
+  return {
+    entry: parsed.entries[0] ?? null,
+    errors: parsed.errors,
+    range: parsed.range,
+    text,
+  };
+}
+
+export function parseSingleAssignmentFromTokens(text: string, tokens: ScriptToken[]): {
+  entry: AssignmentNode | null;
+  errors: ParserError[];
+  range: Range;
+  text: string;
+} {
+  const parsed = parseScriptFromTokens(text, tokens);
+  return {
+    entry: parsed.entries[0] ?? null,
+    errors: parsed.errors,
+    range: parsed.range,
+    text,
+  };
 }
 
 export function findAssignments(entries: AssignmentNode[], key: string): AssignmentNode[] {

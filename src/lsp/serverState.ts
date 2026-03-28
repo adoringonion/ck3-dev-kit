@@ -4,7 +4,9 @@ import { Diagnostic, DiagnosticSeverity, Hover, InlayHint, SemanticTokens } from
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { createDocumentIndexRecord, WorkspaceIndex } from "../core/indexer";
 import { collectParsedReferences, validateParsedReferencesAgainstIndex } from "../core/references";
-import { ParsedDocument, Range as ParsedRange, ReferenceRecord, SymbolRecord } from "../core/types";
+import { AssignmentNode, ParsedDocument, Range as ParsedRange, ReferenceRecord, SymbolRecord, ValueNode } from "../core/types";
+import { QueryEngine } from "./queryEngine";
+import { RequestContext } from "./requestContext";
 
 export type SourceKind = "mod" | "reference";
 
@@ -20,6 +22,10 @@ export interface LiveDocumentRecord {
   parsed: ParsedDocument;
   symbols: SymbolRecord[];
   references: ReferenceRecord[];
+  symbolPositions: Map<string, SymbolRecord[]>;
+  referencePositions: Map<string, ReferenceRecord[]>;
+  referencedNames: string[];
+  diagnosticTags: string[];
   source: SourceKind;
 }
 
@@ -44,6 +50,13 @@ interface DerivedSymbolState {
   revision: number;
   byName: Map<string, SymbolRecord[]>;
   all: SymbolRecord[];
+  nonLocalization: SymbolRecord[];
+  allByFirstChar: Map<string, SymbolRecord[]>;
+  nonLocalizationByFirstChar: Map<string, SymbolRecord[]>;
+  preferredAll: SymbolRecord[];
+  preferredNonLocalization: SymbolRecord[];
+  preferredByFirstChar: Map<string, SymbolRecord[]>;
+  preferredNonLocalizationByFirstChar: Map<string, SymbolRecord[]>;
 }
 
 interface DerivedReferenceState {
@@ -52,6 +65,13 @@ interface DerivedReferenceState {
 }
 
 export class ServerState {
+  private static readonly INDEX_SYMBOL_TAG = "index:symbols";
+  private static readonly INDEX_REFERENCE_TAG = "index:references";
+  private static readonly LIVE_SYMBOL_TAG = "live:symbols";
+  private static readonly LIVE_REFERENCE_TAG = "live:references";
+  private static readonly SNAPSHOT_TAG = "snapshot";
+  private static readonly DIAGNOSTICS_TAG = "diagnostics";
+
   private config: ServerConfig = {
     modRoots: [],
     referenceRoots: [],
@@ -66,8 +86,12 @@ export class ServerState {
   };
   private indexedSymbolsByPath = new Map<string, SymbolRecord[]>();
   private indexedReferencesByPath = new Map<string, ReferenceRecord[]>();
+  private indexedSymbolPositionsByPath = new Map<string, Map<string, SymbolRecord[]>>();
+  private indexedReferencePositionsByPath = new Map<string, Map<string, ReferenceRecord[]>>();
+  private immutableIndexDocuments = new Map<string, ParsedDocument>();
 
   private liveDocuments = new Map<string, LiveDocumentRecord>();
+  private staleDocuments = new Map<string, LiveDocumentRecord>();
   private diagnosticCache = new Map<string, DiagnosticCacheEntry>();
   private hoverCache = new Map<string, Hover | null>();
   private inlayHintCache = new Map<string, VersionedCacheEntry<InlayHint[]>>();
@@ -81,8 +105,9 @@ export class ServerState {
   private lastIndexError: string | null = null;
   private derivedSymbols: DerivedSymbolState | null = null;
   private derivedReferences: DerivedReferenceState | null = null;
-  private completionQueryCache = new Map<string, SymbolRecord[]>();
-  private workspaceSymbolQueryCache = new Map<string, SymbolRecord[]>();
+  private immutableSnapshot: ServerSnapshot | null = null;
+  private immutableSnapshotRevision = -1;
+  private readonly queryEngine = new QueryEngine();
 
   setConfig(config: ServerConfig): void {
     this.config = config;
@@ -96,7 +121,11 @@ export class ServerState {
     this.index = index;
     this.indexedSymbolsByPath = groupSymbolsByPath(index.symbols);
     this.indexedReferencesByPath = groupReferencesByPath(index.references);
+    this.indexedSymbolPositionsByPath = groupSymbolsByPosition(this.indexedSymbolsByPath);
+    this.indexedReferencePositionsByPath = groupReferencesByPosition(this.indexedReferencesByPath);
+    this.immutableIndexDocuments = cloneParsedDocumentMap(index.documents);
     this.indexRevision += 1;
+    this.invalidateIndexQueries();
     this.bumpStateRevision();
     this.indexReady = true;
     this.lastIndexError = null;
@@ -130,34 +159,52 @@ export class ServerState {
   }
 
   snapshot(): ServerSnapshot {
-    const liveDocuments = new Map(this.liveDocuments);
+    if (this.immutableSnapshot && this.immutableSnapshotRevision === this.stateRevision) {
+      return this.immutableSnapshot;
+    }
+    const liveDocuments = cloneLiveDocuments(this.liveDocuments);
     const parsedByUri = new Map<string, ParsedDocument>();
-    const parsedByPath = new Map(this.index.documents);
+    const parsedByPath = new Map<string, ParsedDocument>(this.immutableIndexDocuments);
 
     for (const [uri, record] of liveDocuments.entries()) {
-      parsedByUri.set(uri, record.parsed);
-      parsedByPath.set(uriToFsPath(uri), record.parsed);
+      const parsed = record.parsed;
+      parsedByUri.set(uri, parsed);
+      parsedByPath.set(uriToFsPath(uri), parsed);
     }
 
-    return new ServerSnapshot(this, {
+    this.immutableSnapshot = new ServerSnapshot({
       indexReady: this.indexReady,
+      indexRevision: this.indexRevision,
       lastIndexError: this.lastIndexError,
-      symbolState: this.getDerivedSymbols(),
-      referenceState: this.getDerivedReferences(),
+      symbolState: cloneDerivedSymbolState(this.getDerivedSymbols()),
+      referenceState: cloneDerivedReferenceState(this.getDerivedReferences()),
+      indexedSymbolPositionsByPath: this.indexedSymbolPositionsByPath,
+      indexedReferencePositionsByPath: this.indexedReferencePositionsByPath,
       liveDocuments,
       parsedByUri,
       parsedByPath,
+      hoverCache: new Map(this.hoverCache),
+      inlayHintCache: new Map(this.inlayHintCache),
+      semanticTokenCache: new Map(this.semanticTokenCache),
     });
+    this.immutableSnapshotRevision = this.stateRevision;
+    return this.immutableSnapshot;
   }
 
   setLiveDocument(document: TextDocument, source: SourceKind): LiveDocumentRecord {
     const filePath = uriToFsPath(document.uri);
+    const previous = this.liveDocuments.get(document.uri);
+    const indexed = createDocumentIndexRecord(filePath, document.getText(), source);
     const record = {
       version: document.version,
-      ...createDocumentIndexRecord(filePath, document.getText(), source),
+      ...indexed,
+      symbolPositions: buildSymbolPositionMap(indexed.symbols),
+      referencePositions: buildReferencePositionMap(indexed.references),
+      ...buildDocumentDependencies(document.uri, indexed.symbols, indexed.references),
       source,
     };
     this.liveDocuments.set(document.uri, record);
+    this.invalidateLiveDocumentQueries(document.uri, previous, record);
     this.bumpStateRevision();
     this.clearDocumentFeatureCaches(document.uri);
     return record;
@@ -174,24 +221,46 @@ export class ServerState {
       parsed,
       symbols: this.indexedSymbolsByPath.get(filePath) ?? [],
       references: this.indexedReferencesByPath.get(filePath) ?? [],
+      symbolPositions: this.indexedSymbolPositionsByPath.get(filePath) ?? new Map(),
+      referencePositions: this.indexedReferencePositionsByPath.get(filePath) ?? new Map(),
+      ...buildDocumentDependencies(
+        document.uri,
+        this.indexedSymbolsByPath.get(filePath) ?? [],
+        this.indexedReferencesByPath.get(filePath) ?? [],
+      ),
       source,
     };
+    const previous = this.liveDocuments.get(document.uri);
     this.liveDocuments.set(document.uri, record);
+    this.invalidateLiveDocumentQueries(document.uri, previous, record);
     this.bumpStateRevision();
     this.clearDocumentFeatureCaches(document.uri);
     return record;
   }
 
   deleteLiveDocument(uri: string): void {
+    const previous = this.liveDocuments.get(uri);
     if (this.liveDocuments.delete(uri)) {
+      this.invalidateLiveDocumentQueries(uri, previous, undefined);
       this.bumpStateRevision();
     }
+    this.staleDocuments.delete(uri);
     this.deleteDiagnosticCache(uri);
     this.clearDocumentFeatureCaches(uri);
   }
 
   getLiveDocument(uri: string): LiveDocumentRecord | undefined {
     return this.liveDocuments.get(uri);
+  }
+
+  getStaleDocument(uri: string): LiveDocumentRecord | undefined {
+    return this.staleDocuments.get(uri);
+  }
+
+  getAnalysisBaseParsed(uri: string, filePath?: string): ParsedDocument | undefined {
+    return this.staleDocuments.get(uri)?.parsed
+      ?? this.liveDocuments.get(uri)?.parsed
+      ?? (filePath ? this.index.documents.get(filePath) : undefined);
   }
 
   hasCurrentAnalysis(document: TextDocument): boolean {
@@ -306,16 +375,33 @@ export class ServerState {
     this.semanticTokenCache.delete(uri);
   }
 
-  symbolsByName(name: string): SymbolRecord[] {
-    return this.getDerivedSymbols().byName.get(name) ?? [];
+  symbolsByName(name: string, context?: RequestContext): SymbolRecord[] {
+    return this.queryEngine.evaluate(
+      `symbolsByName:${name}`,
+      () => {
+        context?.checkpoint();
+        return this.getDerivedSymbols(context).byName.get(name) ?? [];
+      },
+      [`symbol:${name}`],
+    );
   }
 
-  referencesByName(name: string): ReferenceRecord[] {
-    return this.getDerivedReferences().byName.get(name) ?? [];
+  referencesByName(name: string, context?: RequestContext): ReferenceRecord[] {
+    return this.queryEngine.evaluate(
+      `referencesByName:${name}`,
+      () => {
+        context?.checkpoint();
+        return this.getDerivedReferences(context).byName.get(name) ?? [];
+      },
+      [`reference:${name}`],
+    );
   }
 
-  allSymbols(query?: string): SymbolRecord[] {
-    const merged = this.getDerivedSymbols().all;
+  allSymbols(query?: string, context?: RequestContext): SymbolRecord[] {
+    const merged = this.queryEngine.evaluate("allSymbols:*", () => {
+      context?.checkpoint();
+      return this.getDerivedSymbols(context).all;
+    }, ["allSymbols"]);
     if (!query) {
       return merged;
     }
@@ -323,12 +409,13 @@ export class ServerState {
     return merged.filter((symbol) => symbol.name.toLowerCase().includes(lowered));
   }
 
-  overlaySymbols(documentUri: string, symbols: SymbolRecord[], names: Set<string>): Map<string, SymbolRecord[]> {
+  overlaySymbols(documentUri: string, symbols: SymbolRecord[], names: Set<string>, context?: RequestContext): Map<string, SymbolRecord[]> {
     const liveUris = new Set(this.liveDocuments.keys());
     liveUris.add(documentUri);
     const merged = new Map<string, SymbolRecord[]>();
 
     for (const name of names) {
+      context?.checkpoint();
       const entries = this.index.symbols.get(name) ?? [];
       const filtered = entries.filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
       if (filtered.length > 0) {
@@ -337,6 +424,7 @@ export class ServerState {
     }
 
     for (const [uri, record] of this.liveDocuments.entries()) {
+      context?.checkpoint();
       if (uri === documentUri) {
         continue;
       }
@@ -351,6 +439,7 @@ export class ServerState {
     }
 
     for (const entry of symbols) {
+      context?.checkpoint();
       if (!names.has(entry.name)) {
         continue;
       }
@@ -390,7 +479,12 @@ export class ServerState {
       this.deleteLiveDocument(document.uri);
       return;
     }
+    const stale = this.liveDocuments.get(document.uri);
     if (this.liveDocuments.delete(document.uri)) {
+      if (stale) {
+        this.staleDocuments.set(document.uri, stale);
+      }
+      this.invalidateLiveDocumentQueries(document.uri, stale, undefined);
       this.bumpStateRevision();
     }
     this.deleteDiagnosticCache(document.uri);
@@ -415,102 +509,134 @@ export class ServerState {
     symbols: SymbolRecord[],
     references: ReferenceRecord[]
   ): LiveDocumentRecord {
+    const previous = this.liveDocuments.get(uri);
     const record: LiveDocumentRecord = {
       version,
       parsed,
       symbols,
       references,
+      symbolPositions: buildSymbolPositionMap(symbols),
+      referencePositions: buildReferencePositionMap(references),
+      ...buildDocumentDependencies(uri, symbols, references),
       source,
     };
     this.liveDocuments.set(uri, record);
+    this.staleDocuments.delete(uri);
+    this.invalidateLiveDocumentQueries(uri, previous, record);
     this.bumpStateRevision();
     this.deleteDiagnosticCache(uri);
     this.clearDocumentFeatureCaches(uri);
     return record;
   }
 
-  collectDocumentDiagnostics(document: TextDocument): Diagnostic[] {
-    const cached = this.getDiagnosticCache(document.uri);
-    if (cached && cached.version === document.version && cached.indexRevision === this.indexRevision) {
-      return cached.diagnostics;
-    }
-
+  collectDocumentDiagnostics(document: TextDocument, context?: RequestContext): Diagnostic[] {
     const filePath = uriToFsPath(document.uri);
     const live = this.getLiveDocument(document.uri);
-    if (!live || live.version !== document.version) {
-      return [];
-    }
-    const diagnostics = this.collectValidationDiagnostics(filePath, live.parsed, live.symbols, live.references);
-    this.setDiagnosticCache(document.uri, document.version, diagnostics);
-    return diagnostics;
+    const tags = live
+      ? live.diagnosticTags
+      : [ServerState.DIAGNOSTICS_TAG, `diagnostics:${document.uri}`];
+    return this.queryEngine.evaluate(`documentDiagnostics:${document.uri}`, () => {
+      context?.checkpoint();
+      const cached = this.getDiagnosticCache(document.uri);
+      if (cached && cached.version === document.version && cached.indexRevision === this.indexRevision) {
+        return cached.diagnostics;
+      }
+
+      if (!live || live.version !== document.version) {
+        return [];
+      }
+      const diagnostics = this.collectValidationDiagnostics(
+        this.snapshot(),
+        document.uri,
+        filePath,
+        live.parsed,
+        live.symbols,
+        live.references,
+        live.referencedNames,
+        context,
+      );
+      this.setDiagnosticCache(document.uri, document.version, diagnostics);
+      return diagnostics;
+    }, tags);
   }
 
-  collectIndexedDiagnostics(filePath: string, parsed: ParsedDocument): Diagnostic[] {
-    return this.collectValidationDiagnostics(filePath, parsed);
+  collectIndexedDiagnostics(filePath: string, parsed: ParsedDocument, context?: RequestContext): Diagnostic[] {
+    const documentUri = pathToFileURL(filePath).toString();
+    const references = this.referenceRecordsForPath(filePath, parsed);
+    const symbols = this.symbolRecordsForPath(filePath, parsed);
+    return this.queryEngine.evaluate(`indexedDiagnostics:${filePath}`, () => this.collectValidationDiagnostics(
+      this.snapshot(),
+      documentUri,
+      filePath,
+      parsed,
+      symbols,
+      references,
+      collectReferencedNames(symbols, references),
+      context,
+    ), diagnosticDependencyTags(documentUri, symbols, references));
   }
 
-  completionSymbols(kinds: string[], query = "", limit = 100): SymbolRecord[] {
+  completionSymbols(kinds: string[], query = "", limit = 100, context?: RequestContext): SymbolRecord[] {
     const normalizedKinds = [...kinds].sort().join(",");
-    const cacheKey = `${normalizedKinds}::${query.toLowerCase()}::${limit}`;
-    const cached = this.completionQueryCache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
+    const cacheKey = `completion:${normalizedKinds}:${query.toLowerCase()}:${limit}`;
+    return this.queryEngine.evaluate(cacheKey, () => {
+      context?.checkpoint();
+      const lowered = query.toLowerCase();
+      const matches: SymbolRecord[] = [];
+      for (const records of this.getDerivedSymbols(context).byName.values()) {
+        context?.checkpoint();
+        const relevant = records
+          .filter((symbol) => symbolMatchesCompletionKinds(symbol.kind, kinds))
+          .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
+        if (relevant.length === 0) {
+          continue;
+        }
+        const candidate = relevant[0];
+        if (lowered && !candidate.name.toLowerCase().includes(lowered)) {
+          continue;
+        }
+        matches.push(candidate);
+      }
 
-    const lowered = query.toLowerCase();
-    const matches: SymbolRecord[] = [];
-    for (const records of this.getDerivedSymbols().byName.values()) {
-      const relevant = records
-        .filter((symbol) => symbolMatchesCompletionKinds(symbol.kind, kinds))
-        .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
-      if (relevant.length === 0) {
-        continue;
-      }
-      const candidate = relevant[0];
-      if (lowered && !candidate.name.toLowerCase().includes(lowered)) {
-        continue;
-      }
-      matches.push(candidate);
-    }
+      matches.sort((left, right) => {
+        const leftName = left.name.toLowerCase();
+        const rightName = right.name.toLowerCase();
+        const leftStarts = lowered ? leftName.startsWith(lowered) : false;
+        const rightStarts = lowered ? rightName.startsWith(lowered) : false;
+        if (leftStarts !== rightStarts) {
+          return Number(rightStarts) - Number(leftStarts);
+        }
+        if (left.source !== right.source) {
+          return Number(right.source === "mod") - Number(left.source === "mod");
+        }
+        return left.name.localeCompare(right.name);
+      });
 
-    matches.sort((left, right) => {
-      const leftName = left.name.toLowerCase();
-      const rightName = right.name.toLowerCase();
-      const leftStarts = lowered ? leftName.startsWith(lowered) : false;
-      const rightStarts = lowered ? rightName.startsWith(lowered) : false;
-      if (leftStarts !== rightStarts) {
-        return Number(rightStarts) - Number(leftStarts);
-      }
-      if (left.source !== right.source) {
-        return Number(right.source === "mod") - Number(left.source === "mod");
-      }
-      return left.name.localeCompare(right.name);
-    });
-
-    const result = matches.slice(0, limit);
-    this.completionQueryCache.set(cacheKey, result);
-    return result;
+      const result = matches.slice(0, limit);
+      return result;
+    }, ["completion"]);
   }
 
-  definitionSymbols(name: string): SymbolRecord[] {
-    return this.symbolsByName(name)
-      .filter((symbol) => symbol.kind !== "localization-reference")
-      .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
+  definitionSymbols(name: string, context?: RequestContext): SymbolRecord[] {
+    return this.queryEngine.evaluate(
+      `definitionSymbols:${name}`,
+      () => this.symbolsByName(name, context)
+        .filter((symbol) => symbol.kind !== "localization-reference")
+        .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod")),
+      [`definition:${name}`],
+    );
   }
 
-  preferredDefinition(name: string): SymbolRecord | undefined {
-    return this.definitionSymbols(name)[0];
+  preferredDefinition(name: string, context?: RequestContext): SymbolRecord | undefined {
+    return this.definitionSymbols(name, context)[0];
   }
 
-  workspaceSymbols(query?: string): SymbolRecord[] {
+  workspaceSymbols(query?: string, context?: RequestContext): SymbolRecord[] {
     const cacheKey = query?.toLowerCase() ?? "";
-    const cached = this.workspaceSymbolQueryCache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-    const result = this.allSymbols(query).filter((symbol) => symbol.kind !== "localization-reference");
-    this.workspaceSymbolQueryCache.set(cacheKey, result);
-    return result;
+    return this.queryEngine.evaluate(`workspaceSymbols:${cacheKey}`, () => {
+      context?.checkpoint();
+      return this.allSymbols(query, context).filter((symbol) => symbol.kind !== "localization-reference");
+    }, ["workspaceSymbols"]);
   }
 
   preferredLocalizationFile(): string | null {
@@ -561,79 +687,102 @@ export class ServerState {
     return null;
   }
 
-  renameCandidate(documentUri: string, position: { line: number; character: number }, name: string): RenameCandidate | null {
-    const filePath = uriToFsPath(documentUri);
-    const live = this.getLiveDocument(documentUri);
-    const symbols = (live?.symbols ?? []).filter((symbol) =>
-      symbol.name === name &&
-      symbol.range.start.line === position.line &&
-      symbol.range.start.character === position.character
-    );
-    if (symbols.length > 0) {
-      return { kind: symbols[0].kind, source: symbols[0].source };
-    }
+  renameCandidate(documentUri: string, position: { line: number; character: number }, name: string, context?: RequestContext): RenameCandidate | null {
+    const cacheKey = `renameCandidate:${documentUri}:${position.line}:${position.character}:${name}`;
+    return this.queryEngine.evaluate(cacheKey, () => {
+      context?.checkpoint();
+      const filePath = uriToFsPath(documentUri);
+      const positionKey = toPositionKey(position.line, position.character);
+      const live = this.getLiveDocument(documentUri);
+      const symbols = (live?.symbolPositions.get(positionKey) ?? []).filter((symbol) => symbol.name === name);
+      if (symbols.length > 0) {
+        return { kind: symbols[0].kind, source: symbols[0].source };
+      }
 
-    const baseSymbols = (this.index.symbols.get(name) ?? []).filter((symbol) =>
-      symbol.path === filePath &&
-      symbol.range.start.line === position.line &&
-      symbol.range.start.character === position.character
-    );
-    if (baseSymbols.length > 0) {
-      return { kind: baseSymbols[0].kind, source: baseSymbols[0].source };
-    }
+      const baseSymbols = (this.indexedSymbolPositionsByPath.get(filePath)?.get(positionKey) ?? [])
+        .filter((symbol) => symbol.name === name);
+      if (baseSymbols.length > 0) {
+        return { kind: baseSymbols[0].kind, source: baseSymbols[0].source };
+      }
 
-    const references = (live?.references ?? []).filter((reference) =>
-      reference.name === name &&
-      reference.range.start.line === position.line &&
-      reference.range.start.character === position.character
-    );
-    if (references.length > 0) {
-      return { kind: referenceKind(references[0]), source: references[0].source };
-    }
+      const references = (live?.referencePositions.get(positionKey) ?? []).filter((reference) => reference.name === name);
+      if (references.length > 0) {
+        return { kind: referenceKind(references[0]), source: references[0].source };
+      }
 
-    const baseReferences = (this.index.references.get(name) ?? []).filter((reference) =>
-      reference.path === filePath &&
-      reference.range.start.line === position.line &&
-      reference.range.start.character === position.character
-    );
-    if (baseReferences.length > 0) {
-      return { kind: referenceKind(baseReferences[0]), source: baseReferences[0].source };
-    }
+      const baseReferences = (this.indexedReferencePositionsByPath.get(filePath)?.get(positionKey) ?? [])
+        .filter((reference) => reference.name === name);
+      if (baseReferences.length > 0) {
+        return { kind: referenceKind(baseReferences[0]), source: baseReferences[0].source };
+      }
 
-    return null;
+      return null;
+    }, [`rename:${documentUri}`, `symbol:${name}`, `reference:${name}`]);
   }
 
   symbolSnippet(symbol: SymbolRecord): string | undefined {
-    const text = this.getParsedDocumentForPath(symbol.path)?.text;
-    if (!text) {
-      return undefined;
-    }
-    const lines = text.split(/\r?\n/);
-    const startLine = Math.max(symbol.range.start.line - 1, 0);
-    const endLine = Math.min(symbol.range.end.line + 1, lines.length - 1);
-    return lines.slice(startLine, endLine + 1).join("\n").trim();
+    return this.queryEngine.evaluate(`symbolSnippet:${symbol.path}:${symbol.range.start.line}:${symbol.range.end.line}`, () => {
+      const lines = this.pathLines(symbol.path);
+      if (!lines) {
+        return undefined;
+      }
+      const startLine = Math.max(symbol.range.start.line - 1, 0);
+      const endLine = Math.min(symbol.range.end.line + 1, lines.length - 1);
+      return lines.slice(startLine, endLine + 1).join("\n").trim();
+    }, [`path:${symbol.path}`]);
   }
 
   localizationText(symbol: SymbolRecord): string | undefined {
     if (symbol.kind !== "localization") {
       return undefined;
     }
-    const parsed = this.getParsedDocumentForPath(symbol.path);
-    if (!parsed || parsed.kind !== "localization") {
-      return undefined;
-    }
-    return parsed.entries.find((entry) => entry.key === symbol.name)?.value;
+    return this.queryEngine.evaluate(`localizationText:${symbol.path}:${symbol.name}`, () => {
+      return this.localizationEntries(symbol.path)?.get(symbol.name);
+    }, [`path:${symbol.path}`, `symbol:${symbol.name}`]);
   }
 
   localizationLanguage(symbol: SymbolRecord): string | null | undefined {
     if (symbol.kind !== "localization") {
       return undefined;
     }
-    const parsed = this.getParsedDocumentForPath(symbol.path);
-    if (!parsed || parsed.kind !== "localization") {
-      return undefined;
-    }
-    return parsed.language;
+    return this.queryEngine.evaluate(`localizationLanguage:${symbol.path}`, () => {
+      const parsed = this.getParsedDocumentForPath(symbol.path);
+      if (!parsed || parsed.kind !== "localization") {
+        return undefined;
+      }
+      return parsed.language;
+    }, [`path:${symbol.path}`]);
+  }
+
+  private pathLines(filePath: string): string[] | undefined {
+    return this.queryEngine.evaluate(`pathLines:${filePath}`, () => {
+      const text = this.getParsedDocumentForPath(filePath)?.text;
+      return text ? text.split(/\r?\n/) : undefined;
+    }, [`path:${filePath}`]);
+  }
+
+  private localizationEntries(filePath: string): Map<string, string> | undefined {
+    return this.queryEngine.evaluate(`localizationEntries:${filePath}`, () => {
+      const parsed = this.getParsedDocumentForPath(filePath);
+      if (!parsed || parsed.kind !== "localization") {
+        return undefined;
+      }
+      const entries = new Map<string, string>();
+      for (const entry of parsed.entries) {
+        entries.set(entry.key, entry.value);
+      }
+      return entries;
+    }, [`path:${filePath}`]);
+  }
+
+  private symbolRecordsForPath(filePath: string, parsed: ParsedDocument): SymbolRecord[] {
+    return this.indexedSymbolsByPath.get(filePath)
+      ?? createDocumentIndexRecord(filePath, parsed.text, this.resolveSource(filePath)).symbols;
+  }
+
+  private referenceRecordsForPath(filePath: string, parsed: ParsedDocument): ReferenceRecord[] {
+    return this.indexedReferencesByPath.get(filePath)
+      ?? collectParsedReferences(parsed);
   }
 
   scheduleDocumentDiagnostics(uri: string, delayMs: number, publish: () => void): void {
@@ -693,6 +842,8 @@ export class ServerState {
       initialDelayMs?: number;
       batchBudgetMs?: number;
       batchIntervalMs?: number;
+      isCancelled?: () => boolean;
+      onProgress?: (processed: number, total: number) => void;
     }
   ): void {
     const initialDelayMs = options?.initialDelayMs ?? 5000;
@@ -702,21 +853,30 @@ export class ServerState {
     let cursor = 0;
 
     const processBatch = () => {
-      if (runId !== this.workspaceDiagnosticRun) {
+      if (runId !== this.workspaceDiagnosticRun || options?.isCancelled?.()) {
         return;
       }
       const started = Date.now();
       while (cursor < entries.length && Date.now() - started < batchBudgetMs) {
+        if (options?.isCancelled?.()) {
+          return;
+        }
         processEntry(entries[cursor]);
         cursor += 1;
       }
+      options?.onProgress?.(cursor, entries.length);
 
-      if (cursor < entries.length) {
+      if (cursor < entries.length && !options?.isCancelled?.()) {
         setTimeout(processBatch, batchIntervalMs);
       }
     };
 
-    setTimeout(processBatch, initialDelayMs);
+    setTimeout(() => {
+      if (options?.isCancelled?.()) {
+        return;
+      }
+      processBatch();
+    }, initialDelayMs);
   }
 
   cancelWorkspaceDiagnostics(): void {
@@ -725,91 +885,188 @@ export class ServerState {
 
   private bumpStateRevision(): void {
     this.stateRevision += 1;
+    this.immutableSnapshot = null;
+    this.immutableSnapshotRevision = -1;
+  }
+
+  private getDerivedSymbols(context?: RequestContext): DerivedSymbolState {
+    return this.queryEngine.evaluate("derivedSymbols", () => {
+      if (this.derivedSymbols && this.derivedSymbols.revision === this.stateRevision) {
+        return this.derivedSymbols;
+      }
+      context?.checkpoint();
+      const liveUris = new Set(this.liveDocuments.keys());
+      const byName = new Map<string, SymbolRecord[]>();
+      const all: SymbolRecord[] = [];
+      let processed = 0;
+
+      for (const [name, entries] of this.index.symbols.entries()) {
+        if (processed % 128 === 0) {
+          context?.checkpoint();
+        }
+        processed += 1;
+        const filtered = entries.filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
+        if (filtered.length === 0) {
+          continue;
+        }
+        byName.set(name, [...filtered]);
+        all.push(...filtered);
+      }
+
+      for (const record of this.liveDocuments.values()) {
+        context?.checkpoint();
+        for (const entry of record.symbols) {
+          const existing = byName.get(entry.name) ?? [];
+          existing.push(entry);
+          byName.set(entry.name, existing);
+          all.push(entry);
+        }
+      }
+
+      const preferredAll = buildPreferredSymbols(byName, false);
+      const preferredNonLocalization = buildPreferredSymbols(byName, true);
+      const nonLocalization = all.filter((symbol) => symbol.kind !== "localization-reference");
+      this.derivedSymbols = {
+        revision: this.stateRevision,
+        byName,
+        all,
+        nonLocalization,
+        allByFirstChar: buildPreferredByFirstChar(all),
+        nonLocalizationByFirstChar: buildPreferredByFirstChar(nonLocalization),
+        preferredAll,
+        preferredNonLocalization,
+        preferredByFirstChar: buildPreferredByFirstChar(preferredAll),
+        preferredNonLocalizationByFirstChar: buildPreferredByFirstChar(preferredNonLocalization),
+      };
+      return this.derivedSymbols;
+    }, [ServerState.INDEX_SYMBOL_TAG, ServerState.LIVE_SYMBOL_TAG]);
+  }
+
+  private getDerivedReferences(context?: RequestContext): DerivedReferenceState {
+    return this.queryEngine.evaluate("derivedReferences", () => {
+      if (this.derivedReferences && this.derivedReferences.revision === this.stateRevision) {
+        return this.derivedReferences;
+      }
+      context?.checkpoint();
+      const liveUris = new Set(this.liveDocuments.keys());
+      const byName = new Map<string, ReferenceRecord[]>();
+      let processed = 0;
+
+      for (const [name, entries] of this.index.references.entries()) {
+        if (processed % 128 === 0) {
+          context?.checkpoint();
+        }
+        processed += 1;
+        const filtered = entries.filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
+        if (filtered.length > 0) {
+          byName.set(name, [...filtered]);
+        }
+      }
+
+      for (const record of this.liveDocuments.values()) {
+        context?.checkpoint();
+        for (const entry of record.references) {
+          const existing = byName.get(entry.name) ?? [];
+          existing.push(entry);
+          byName.set(entry.name, existing);
+        }
+      }
+
+      this.derivedReferences = {
+        revision: this.stateRevision,
+        byName,
+      };
+      return this.derivedReferences;
+    }, [ServerState.INDEX_REFERENCE_TAG, ServerState.LIVE_REFERENCE_TAG]);
+  }
+
+  private invalidateIndexQueries(): void {
     this.derivedSymbols = null;
     this.derivedReferences = null;
-    this.completionQueryCache.clear();
-    this.workspaceSymbolQueryCache.clear();
+    this.queryEngine.markDirtyTag(ServerState.INDEX_SYMBOL_TAG);
+    this.queryEngine.markDirtyTag(ServerState.INDEX_REFERENCE_TAG);
+    this.queryEngine.markDirtyTag(ServerState.SNAPSHOT_TAG);
+    this.queryEngine.markDirtyTag(ServerState.DIAGNOSTICS_TAG);
   }
 
-  private getDerivedSymbols(): DerivedSymbolState {
-    if (this.derivedSymbols && this.derivedSymbols.revision === this.stateRevision) {
-      return this.derivedSymbols;
+  private invalidateLiveDocumentQueries(
+    uri: string,
+    previous: LiveDocumentRecord | undefined,
+    next: LiveDocumentRecord | undefined,
+  ): void {
+    if (this.derivedSymbols) {
+      updateDerivedSymbolsForLiveChange(this.derivedSymbols, previous, next);
+      this.derivedSymbols.revision = this.stateRevision + 1;
     }
-    const liveUris = new Set(this.liveDocuments.keys());
-    const byName = new Map<string, SymbolRecord[]>();
-    const all: SymbolRecord[] = [];
-
-    for (const [name, entries] of this.index.symbols.entries()) {
-      const filtered = entries.filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
-      if (filtered.length === 0) {
-        continue;
-      }
-      byName.set(name, [...filtered]);
-      all.push(...filtered);
+    if (this.derivedReferences) {
+      updateDerivedReferencesForLiveChange(this.derivedReferences, previous, next);
+      this.derivedReferences.revision = this.stateRevision + 1;
     }
+    const symbolNames = new Set<string>();
+    const referenceNames = new Set<string>();
 
-    for (const record of this.liveDocuments.values()) {
-      for (const entry of record.symbols) {
-        const existing = byName.get(entry.name) ?? [];
-        existing.push(entry);
-        byName.set(entry.name, existing);
-        all.push(entry);
-      }
+    for (const symbol of previous?.symbols ?? []) {
+      symbolNames.add(symbol.name);
     }
-
-    this.derivedSymbols = {
-      revision: this.stateRevision,
-      byName,
-      all,
-    };
-    return this.derivedSymbols;
-  }
-
-  private getDerivedReferences(): DerivedReferenceState {
-    if (this.derivedReferences && this.derivedReferences.revision === this.stateRevision) {
-      return this.derivedReferences;
+    for (const symbol of next?.symbols ?? []) {
+      symbolNames.add(symbol.name);
     }
-    const liveUris = new Set(this.liveDocuments.keys());
-    const byName = new Map<string, ReferenceRecord[]>();
-
-    for (const [name, entries] of this.index.references.entries()) {
-      const filtered = entries.filter((entry) => !liveUris.has(pathToFileURL(entry.path).toString()));
-      if (filtered.length > 0) {
-        byName.set(name, [...filtered]);
-      }
+    for (const reference of previous?.references ?? []) {
+      referenceNames.add(reference.name);
+    }
+    for (const reference of next?.references ?? []) {
+      referenceNames.add(reference.name);
     }
 
-    for (const record of this.liveDocuments.values()) {
-      for (const entry of record.references) {
-        const existing = byName.get(entry.name) ?? [];
-        existing.push(entry);
-        byName.set(entry.name, existing);
-      }
+    this.queryEngine.markDirtyTag(ServerState.LIVE_SYMBOL_TAG);
+    this.queryEngine.markDirtyTag(ServerState.LIVE_REFERENCE_TAG);
+    this.queryEngine.markDirtyTag(ServerState.SNAPSHOT_TAG);
+    this.queryEngine.markDirtyTag(ServerState.DIAGNOSTICS_TAG);
+    this.queryEngine.markDirtyTag(`diagnostics:${uri}`);
+    this.queryEngine.markDirtyTag(`rename:${uri}`);
+    this.queryEngine.markDirtyTag(`path:${uriToFsPath(uri)}`);
+
+    for (const tag of previous?.diagnosticTags ?? []) {
+      this.queryEngine.markDirtyTag(tag);
+    }
+    for (const tag of next?.diagnosticTags ?? []) {
+      this.queryEngine.markDirtyTag(tag);
     }
 
-    this.derivedReferences = {
-      revision: this.stateRevision,
-      byName,
-    };
-    return this.derivedReferences;
+    for (const name of symbolNames) {
+      this.queryEngine.markDirtyTag(`symbol:${name}`);
+      this.queryEngine.markDirtyTag(`definition:${name}`);
+    }
+
+    for (const name of referenceNames) {
+      this.queryEngine.markDirtyTag(`reference:${name}`);
+    }
   }
 
   private collectValidationDiagnostics(
+    snapshot: ServerSnapshot,
+    documentUri: string,
     filePath: string,
     parsed: ParsedDocument,
     liveSymbols?: SymbolRecord[],
-    liveReferences?: ReferenceRecord[]
+    liveReferences?: ReferenceRecord[],
+    referencedNames?: string[],
+    context?: RequestContext,
   ): Diagnostic[] {
-    const symbols = liveSymbols ?? createDocumentIndexRecord(filePath, parsed.text, this.resolveSource(filePath)).symbols;
-    const references = liveReferences ?? collectParsedReferences(parsed);
-    const referencedNames = new Set(references.map((reference) => reference.name));
-    for (const symbol of symbols) {
-      referencedNames.add(symbol.name);
-    }
-    const overlayedSymbols = this.overlaySymbols(pathToFileURL(filePath).toString(), symbols, referencedNames);
+    context?.checkpoint();
+    const symbols = liveSymbols ?? this.symbolRecordsForPath(filePath, parsed);
+    const references = liveReferences ?? this.referenceRecordsForPath(filePath, parsed);
+    const overlayedSymbols = snapshot.overlaySymbols(
+      documentUri,
+      symbols,
+      new Set(referencedNames ?? collectReferencedNames(symbols, references)),
+      context,
+    );
     const validation = validateParsedReferencesAgainstIndex(parsed, references, {
       ...this.index,
       symbols: overlayedSymbols,
+    }, {
+      checkpoint: () => context?.checkpoint(),
     });
 
     const diagnostics = validation.map((entry) => ({
@@ -907,17 +1164,328 @@ function groupReferencesByPath(indexedReferences: Map<string, ReferenceRecord[]>
   return grouped;
 }
 
+function buildPreferredSymbols(byName: Map<string, SymbolRecord[]>, excludeLocalization: boolean): SymbolRecord[] {
+  const preferred: SymbolRecord[] = [];
+  for (const records of byName.values()) {
+    const filtered = excludeLocalization
+      ? records.filter((symbol) => symbol.kind !== "localization-reference")
+      : records;
+    if (filtered.length === 0) {
+      continue;
+    }
+    const sorted = [...filtered].sort((left, right) => {
+      if (left.source !== right.source) {
+        return Number(right.source === "mod") - Number(left.source === "mod");
+      }
+      return left.name.localeCompare(right.name);
+    });
+    preferred.push(sorted[0]);
+  }
+  return preferred;
+}
+
+function buildPreferredByFirstChar(symbols: SymbolRecord[]): Map<string, SymbolRecord[]> {
+  const grouped = new Map<string, SymbolRecord[]>();
+  for (const symbol of symbols) {
+    const key = symbol.name[0]?.toLowerCase() ?? "";
+    const existing = grouped.get(key) ?? [];
+    existing.push(symbol);
+    grouped.set(key, existing);
+  }
+  return grouped;
+}
+
+function cloneSymbolArrayMap(source: Map<string, SymbolRecord[]>): Map<string, SymbolRecord[]> {
+  const cloned = new Map<string, SymbolRecord[]>();
+  for (const [key, symbols] of source.entries()) {
+    cloned.set(key, [...symbols]);
+  }
+  return cloned;
+}
+
+function cloneReferenceArrayMap(source: Map<string, ReferenceRecord[]>): Map<string, ReferenceRecord[]> {
+  const cloned = new Map<string, ReferenceRecord[]>();
+  for (const [key, references] of source.entries()) {
+    cloned.set(key, [...references]);
+  }
+  return cloned;
+}
+
+function updateDerivedSymbolsForLiveChange(
+  state: DerivedSymbolState,
+  previous: LiveDocumentRecord | undefined,
+  next: LiveDocumentRecord | undefined,
+): void {
+  for (const symbol of previous?.symbols ?? []) {
+    const existing = state.byName.get(symbol.name);
+    if (!existing) {
+      continue;
+    }
+    const filtered = existing.filter((entry) => entry.path !== symbol.path || entry.range.start.offset !== symbol.range.start.offset);
+    if (filtered.length === 0) {
+      state.byName.delete(symbol.name);
+    } else {
+      state.byName.set(symbol.name, filtered);
+    }
+  }
+  for (const symbol of next?.symbols ?? []) {
+    const existing = state.byName.get(symbol.name) ?? [];
+    existing.push(symbol);
+    state.byName.set(symbol.name, existing);
+  }
+  const preferredAll = buildPreferredSymbols(state.byName, false);
+  const preferredNonLocalization = buildPreferredSymbols(state.byName, true);
+  state.all = flattenSymbolMap(state.byName);
+  state.nonLocalization = state.all.filter((symbol) => symbol.kind !== "localization-reference");
+  state.allByFirstChar = buildPreferredByFirstChar(state.all);
+  state.nonLocalizationByFirstChar = buildPreferredByFirstChar(state.nonLocalization);
+  state.preferredAll = preferredAll;
+  state.preferredNonLocalization = preferredNonLocalization;
+  state.preferredByFirstChar = buildPreferredByFirstChar(preferredAll);
+  state.preferredNonLocalizationByFirstChar = buildPreferredByFirstChar(preferredNonLocalization);
+}
+
+function updateDerivedReferencesForLiveChange(
+  state: DerivedReferenceState,
+  previous: LiveDocumentRecord | undefined,
+  next: LiveDocumentRecord | undefined,
+): void {
+  for (const reference of previous?.references ?? []) {
+    const existing = state.byName.get(reference.name);
+    if (!existing) {
+      continue;
+    }
+    const filtered = existing.filter((entry) => entry.path !== reference.path || entry.range.start.offset !== reference.range.start.offset);
+    if (filtered.length === 0) {
+      state.byName.delete(reference.name);
+    } else {
+      state.byName.set(reference.name, filtered);
+    }
+  }
+  for (const reference of next?.references ?? []) {
+    const existing = state.byName.get(reference.name) ?? [];
+    existing.push(reference);
+    state.byName.set(reference.name, existing);
+  }
+}
+
+function flattenSymbolMap(byName: Map<string, SymbolRecord[]>): SymbolRecord[] {
+  const all: SymbolRecord[] = [];
+  for (const symbols of byName.values()) {
+    all.push(...symbols);
+  }
+  return all;
+}
+
+function buildSymbolPositionMap(symbols: SymbolRecord[]): Map<string, SymbolRecord[]> {
+  const grouped = new Map<string, SymbolRecord[]>();
+  for (const symbol of symbols) {
+    const key = toPositionKey(symbol.range.start.line, symbol.range.start.character);
+    const existing = grouped.get(key) ?? [];
+    existing.push(symbol);
+    grouped.set(key, existing);
+  }
+  return grouped;
+}
+
+function buildReferencePositionMap(references: ReferenceRecord[]): Map<string, ReferenceRecord[]> {
+  const grouped = new Map<string, ReferenceRecord[]>();
+  for (const reference of references) {
+    const key = toPositionKey(reference.range.start.line, reference.range.start.character);
+    const existing = grouped.get(key) ?? [];
+    existing.push(reference);
+    grouped.set(key, existing);
+  }
+  return grouped;
+}
+
+function groupSymbolsByPosition(groupedByPath: Map<string, SymbolRecord[]>): Map<string, Map<string, SymbolRecord[]>> {
+  const result = new Map<string, Map<string, SymbolRecord[]>>();
+  for (const [filePath, symbols] of groupedByPath.entries()) {
+    result.set(filePath, buildSymbolPositionMap(symbols));
+  }
+  return result;
+}
+
+function groupReferencesByPosition(groupedByPath: Map<string, ReferenceRecord[]>): Map<string, Map<string, ReferenceRecord[]>> {
+  const result = new Map<string, Map<string, ReferenceRecord[]>>();
+  for (const [filePath, references] of groupedByPath.entries()) {
+    result.set(filePath, buildReferencePositionMap(references));
+  }
+  return result;
+}
+
+function toPositionKey(line: number, character: number): string {
+  return `${line}:${character}`;
+}
+
+function diagnosticDependencyTags(
+  documentUri: string,
+  symbols: SymbolRecord[],
+  references: ReferenceRecord[],
+): string[] {
+  return buildDocumentDependencies(documentUri, symbols, references).diagnosticTags;
+}
+
+function buildDocumentDependencies(
+  documentUri: string,
+  symbols: SymbolRecord[],
+  references: ReferenceRecord[],
+): { referencedNames: string[]; diagnosticTags: string[] } {
+  const names = new Set<string>();
+  const tags = new Set<string>([
+    "diagnostics",
+    `diagnostics:${documentUri}`,
+  ]);
+
+  for (const symbol of symbols) {
+    names.add(symbol.name);
+    tags.add(`symbol:${symbol.name}`);
+    tags.add(`definition:${symbol.name}`);
+  }
+  for (const reference of references) {
+    names.add(reference.name);
+    tags.add(`reference:${reference.name}`);
+    tags.add(`symbol:${reference.name}`);
+    tags.add(`definition:${reference.name}`);
+  }
+
+  return {
+    referencedNames: [...names],
+    diagnosticTags: [...tags],
+  };
+}
+
+function collectReferencedNames(symbols: SymbolRecord[], references: ReferenceRecord[]): string[] {
+  return buildDocumentDependencies("<in-memory>", symbols, references).referencedNames;
+}
+
+function cloneDerivedSymbolState(state: DerivedSymbolState): DerivedSymbolState {
+  const byName = new Map<string, SymbolRecord[]>();
+  for (const [name, entries] of state.byName.entries()) {
+    byName.set(name, [...entries]);
+  }
+  return {
+    revision: state.revision,
+    byName,
+    all: [...state.all],
+    nonLocalization: [...state.nonLocalization],
+    allByFirstChar: cloneSymbolArrayMap(state.allByFirstChar),
+    nonLocalizationByFirstChar: cloneSymbolArrayMap(state.nonLocalizationByFirstChar),
+    preferredAll: [...state.preferredAll],
+    preferredNonLocalization: [...state.preferredNonLocalization],
+    preferredByFirstChar: cloneSymbolArrayMap(state.preferredByFirstChar),
+    preferredNonLocalizationByFirstChar: cloneSymbolArrayMap(state.preferredNonLocalizationByFirstChar),
+  };
+}
+
+function cloneDerivedReferenceState(state: DerivedReferenceState): DerivedReferenceState {
+  const byName = new Map<string, ReferenceRecord[]>();
+  for (const [name, entries] of state.byName.entries()) {
+    byName.set(name, [...entries]);
+  }
+  return {
+    revision: state.revision,
+    byName,
+  };
+}
+
+function cloneLiveDocuments(records: Map<string, LiveDocumentRecord>): Map<string, LiveDocumentRecord> {
+  const cloned = new Map<string, LiveDocumentRecord>();
+  for (const [uri, record] of records.entries()) {
+    cloned.set(uri, {
+      ...record,
+      parsed: cloneParsedDocument(record.parsed),
+      symbols: [...record.symbols],
+      references: [...record.references],
+      symbolPositions: cloneSymbolArrayMap(record.symbolPositions),
+      referencePositions: cloneReferenceArrayMap(record.referencePositions),
+      referencedNames: [...record.referencedNames],
+      diagnosticTags: [...record.diagnosticTags],
+    });
+  }
+  return cloned;
+}
+
+function cloneParsedDocumentMap(records: Map<string, ParsedDocument>): Map<string, ParsedDocument> {
+  const cloned = new Map<string, ParsedDocument>();
+  for (const [filePath, parsed] of records.entries()) {
+    cloned.set(filePath, cloneParsedDocument(parsed));
+  }
+  return cloned;
+}
+
+function cloneParsedDocument(document: ParsedDocument): ParsedDocument {
+  if (document.kind === "localization") {
+    return {
+      ...document,
+      entries: document.entries.map((entry) => ({ ...entry, range: cloneRange(entry.range) })),
+      errors: document.errors.map((error) => ({ ...error, range: cloneRange(error.range) })),
+    };
+  }
+
+  return {
+    ...document,
+    entries: document.entries.map(cloneAssignment),
+    errors: document.errors.map((error) => ({ ...error, range: cloneRange(error.range) })),
+    tokens: document.tokens.map((token) => ({ ...token })),
+  };
+}
+
+function cloneAssignment(entry: AssignmentNode): AssignmentNode {
+  return {
+    ...entry,
+    keyRange: cloneRange(entry.keyRange),
+    operatorRange: cloneRange(entry.operatorRange),
+    range: cloneRange(entry.range),
+    value: cloneValue(entry.value),
+  };
+}
+
+function cloneValue(value: ValueNode): ValueNode {
+  if (value.kind === "object") {
+    return {
+      ...value,
+      entries: value.entries.map(cloneAssignment),
+      range: cloneRange(value.range),
+    };
+  }
+  if (value.kind === "list") {
+    return {
+      ...value,
+      items: value.items.map(cloneValue),
+      range: cloneRange(value.range),
+    };
+  }
+  return { ...value, range: cloneRange(value.range) };
+}
+
+function cloneRange(range: ParsedRange): ParsedRange {
+  return {
+    start: { ...range.start },
+    end: { ...range.end },
+  };
+}
+
 export class ServerSnapshot {
+  private readonly pathLinesCache = new Map<string, string[]>();
+  private readonly localizationEntryCache = new Map<string, Map<string, string>>();
+
   constructor(
-    private readonly state: ServerState,
     private readonly view: {
       indexReady: boolean;
+      indexRevision: number;
       lastIndexError: string | null;
       symbolState: DerivedSymbolState;
       referenceState: DerivedReferenceState;
+      indexedSymbolPositionsByPath: Map<string, Map<string, SymbolRecord[]>>;
+      indexedReferencePositionsByPath: Map<string, Map<string, ReferenceRecord[]>>;
       liveDocuments: Map<string, LiveDocumentRecord>;
       parsedByUri: Map<string, ParsedDocument>;
       parsedByPath: Map<string, ParsedDocument>;
+      hoverCache: Map<string, Hover | null>;
+      inlayHintCache: Map<string, VersionedCacheEntry<InlayHint[]>>;
+      semanticTokenCache: Map<string, VersionedCacheEntry<SemanticTokens>>;
     },
   ) {}
 
@@ -929,89 +1497,170 @@ export class ServerSnapshot {
     return this.view.lastIndexError;
   }
 
-  getHoverCache(key: string): Hover | null | undefined {
-    return this.state.getHoverCache(key);
+  getIndexRevision(): number {
+    return this.view.indexRevision;
   }
 
-  setHoverCache(key: string, hover: Hover | null): void {
-    this.state.setHoverCache(key, hover);
+  getHoverCache(key: string): Hover | null | undefined {
+    return this.view.hoverCache.get(key);
   }
 
   parsedDocumentForUri(uri: string): ParsedDocument | undefined {
     return this.view.parsedByUri.get(uri);
   }
 
-  symbolsByName(name: string): SymbolRecord[] {
+  symbolsByName(name: string, context?: RequestContext): SymbolRecord[] {
+    context?.checkpoint();
     return this.view.symbolState.byName.get(name) ?? [];
   }
 
-  referencesByName(name: string): ReferenceRecord[] {
+  referencesByName(name: string, context?: RequestContext): ReferenceRecord[] {
+    context?.checkpoint();
     return this.view.referenceState.byName.get(name) ?? [];
   }
 
-  definitionSymbols(name: string): SymbolRecord[] {
-    return this.symbolsByName(name)
+  definitionSymbols(name: string, context?: RequestContext): SymbolRecord[] {
+    context?.checkpoint();
+    return this.symbolsByName(name, context)
       .filter((symbol) => symbol.kind !== "localization-reference")
       .sort((left, right) => Number(right.source === "mod") - Number(left.source === "mod"));
   }
 
-  workspaceSymbols(query?: string): SymbolRecord[] {
-    if (!query) {
-      return this.view.symbolState.all.filter((symbol) => symbol.kind !== "localization-reference");
-    }
-    const lowered = query.toLowerCase();
-    return this.view.symbolState.all
-      .filter((symbol) => symbol.kind !== "localization-reference")
-      .filter((symbol) => symbol.name.toLowerCase().includes(lowered));
+  preferredDefinition(name: string, context?: RequestContext): SymbolRecord | undefined {
+    return this.definitionSymbols(name, context)[0];
   }
 
-  allSymbols(query?: string): SymbolRecord[] {
+  workspaceSymbols(query?: string, context?: RequestContext): SymbolRecord[] {
+    context?.checkpoint();
+    if (!query) {
+      return this.view.symbolState.preferredNonLocalization;
+    }
+    const lowered = query.toLowerCase();
+    const pool = this.candidateSymbolsForQuery(
+      this.view.symbolState.preferredNonLocalizationByFirstChar,
+      this.view.symbolState.preferredNonLocalization,
+      lowered,
+    );
+    return pool.filter((symbol, index) => {
+      if (index % 256 === 0) {
+        context?.checkpoint();
+      }
+      return symbol.name.toLowerCase().includes(lowered);
+    });
+  }
+
+  allSymbols(query?: string, context?: RequestContext): SymbolRecord[] {
+    context?.checkpoint();
     if (!query) {
       return this.view.symbolState.all;
     }
     const lowered = query.toLowerCase();
-    return this.view.symbolState.all.filter((symbol) => symbol.name.toLowerCase().includes(lowered));
+    const pool = this.candidateSymbolsForQuery(
+      this.view.symbolState.allByFirstChar,
+      this.view.symbolState.all,
+      lowered,
+    );
+    return pool.filter((symbol, index) => {
+      if (index % 256 === 0) {
+        context?.checkpoint();
+      }
+      return symbol.name.toLowerCase().includes(lowered);
+    });
   }
 
-  completionSymbols(kinds: string[], query = "", limit = 100): SymbolRecord[] {
-    return this.state.completionSymbols(kinds, query, limit);
+  completionSymbols(kinds: string[], query = "", limit = 100, context?: RequestContext): SymbolRecord[] {
+    const lowered = query.toLowerCase();
+    const pool = this.candidateSymbolsForQuery(
+      this.view.symbolState.preferredByFirstChar,
+      this.view.symbolState.preferredAll,
+      lowered,
+    );
+    const matches: SymbolRecord[] = [];
+    let inspected = 0;
+
+    for (const candidate of pool) {
+      if (inspected % 128 === 0) {
+        context?.checkpoint();
+      }
+      inspected += 1;
+      if (!symbolMatchesCompletionKinds(candidate.kind, kinds)) {
+        continue;
+      }
+      if (lowered && !candidate.name.toLowerCase().includes(lowered)) {
+        continue;
+      }
+      matches.push(candidate);
+    }
+
+    matches.sort((left, right) => {
+      const leftName = left.name.toLowerCase();
+      const rightName = right.name.toLowerCase();
+      const leftStarts = lowered ? leftName.startsWith(lowered) : false;
+      const rightStarts = lowered ? rightName.startsWith(lowered) : false;
+      if (leftStarts !== rightStarts) {
+        return Number(rightStarts) - Number(leftStarts);
+      }
+      if (left.source !== right.source) {
+        return Number(right.source === "mod") - Number(left.source === "mod");
+      }
+      return left.name.localeCompare(right.name);
+    });
+
+    return matches.slice(0, limit);
   }
 
-  renameCandidate(documentUri: string, position: { line: number; character: number }, name: string): RenameCandidate | null {
+  overlaySymbols(documentUri: string, symbols: SymbolRecord[], names: Set<string>, context?: RequestContext): Map<string, SymbolRecord[]> {
+    const merged = new Map<string, SymbolRecord[]>();
+    let processed = 0;
+
+    for (const name of names) {
+      if (processed % 128 === 0) {
+        context?.checkpoint();
+      }
+      processed += 1;
+      const entries = (this.symbolsByName(name, context) ?? [])
+        .filter((entry) => pathToFileURL(entry.path).toString() !== documentUri);
+      if (entries.length > 0) {
+        merged.set(name, [...entries]);
+      }
+    }
+
+    for (const entry of symbols) {
+      if (!names.has(entry.name)) {
+        continue;
+      }
+      const existing = merged.get(entry.name) ?? [];
+      existing.push(entry);
+      merged.set(entry.name, existing);
+    }
+
+    return merged;
+  }
+
+  renameCandidate(documentUri: string, position: { line: number; character: number }, name: string, context?: RequestContext): RenameCandidate | null {
     const filePath = uriToFsPath(documentUri);
     const live = this.view.liveDocuments.get(documentUri);
-    const symbols = (live?.symbols ?? []).filter((symbol) =>
-      symbol.name === name &&
-      symbol.range.start.line === position.line &&
-      symbol.range.start.character === position.character
-    );
+    const positionKey = toPositionKey(position.line, position.character);
+    const symbols = (live?.symbolPositions.get(positionKey) ?? []).filter((symbol) => symbol.name === name);
     if (symbols.length > 0) {
       return { kind: symbols[0].kind, source: symbols[0].source };
     }
 
-    const baseSymbols = this.symbolsByName(name).filter((symbol) =>
-      symbol.path === filePath &&
-      symbol.range.start.line === position.line &&
-      symbol.range.start.character === position.character
-    );
+    context?.checkpoint();
+    const baseSymbols = (this.view.indexedSymbolPositionsByPath.get(filePath)?.get(positionKey) ?? [])
+      .filter((symbol) => symbol.name === name);
     if (baseSymbols.length > 0) {
       return { kind: baseSymbols[0].kind, source: baseSymbols[0].source };
     }
 
-    const references = (live?.references ?? []).filter((reference) =>
-      reference.name === name &&
-      reference.range.start.line === position.line &&
-      reference.range.start.character === position.character
-    );
+    const references = (live?.referencePositions.get(positionKey) ?? []).filter((reference) => reference.name === name);
     if (references.length > 0) {
       return { kind: referenceKind(references[0]), source: references[0].source };
     }
 
-    const baseReferences = this.referencesByName(name).filter((reference) =>
-      reference.path === filePath &&
-      reference.range.start.line === position.line &&
-      reference.range.start.character === position.character
-    );
+    context?.checkpoint();
+    const baseReferences = (this.view.indexedReferencePositionsByPath.get(filePath)?.get(positionKey) ?? [])
+      .filter((reference) => reference.name === name);
     if (baseReferences.length > 0) {
       return { kind: referenceKind(baseReferences[0]), source: baseReferences[0].source };
     }
@@ -1020,11 +1669,10 @@ export class ServerSnapshot {
   }
 
   symbolSnippet(symbol: SymbolRecord): string | undefined {
-    const text = this.view.parsedByPath.get(symbol.path)?.text;
-    if (!text) {
+    const lines = this.pathLines(symbol.path);
+    if (!lines) {
       return undefined;
     }
-    const lines = text.split(/\r?\n/);
     const startLine = Math.max(symbol.range.start.line - 1, 0);
     const endLine = Math.min(symbol.range.end.line + 1, lines.length - 1);
     return lines.slice(startLine, endLine + 1).join("\n").trim();
@@ -1034,11 +1682,7 @@ export class ServerSnapshot {
     if (symbol.kind !== "localization") {
       return undefined;
     }
-    const parsed = this.view.parsedByPath.get(symbol.path);
-    if (!parsed || parsed.kind !== "localization") {
-      return undefined;
-    }
-    return parsed.entries.find((entry) => entry.key === symbol.name)?.value;
+    return this.localizationEntries(symbol.path)?.get(symbol.name);
   }
 
   localizationLanguage(symbol: SymbolRecord): string | null | undefined {
@@ -1052,19 +1696,61 @@ export class ServerSnapshot {
     return parsed.language;
   }
 
-  inlayHintCache(uri: string, version: number): InlayHint[] | undefined {
-    return this.state.getInlayHintCache(uri, version);
+  private pathLines(filePath: string): string[] | undefined {
+    const cached = this.pathLinesCache.get(filePath);
+    if (cached) {
+      return cached;
+    }
+    const text = this.view.parsedByPath.get(filePath)?.text;
+    if (!text) {
+      return undefined;
+    }
+    const lines = text.split(/\r?\n/);
+    this.pathLinesCache.set(filePath, lines);
+    return lines;
   }
 
-  setInlayHintCache(uri: string, version: number, hints: InlayHint[]): void {
-    this.state.setInlayHintCache(uri, version, hints);
+  private localizationEntries(filePath: string): Map<string, string> | undefined {
+    const cached = this.localizationEntryCache.get(filePath);
+    if (cached) {
+      return cached;
+    }
+    const parsed = this.view.parsedByPath.get(filePath);
+    if (!parsed || parsed.kind !== "localization") {
+      return undefined;
+    }
+    const entries = new Map<string, string>();
+    for (const entry of parsed.entries) {
+      entries.set(entry.key, entry.value);
+    }
+    this.localizationEntryCache.set(filePath, entries);
+    return entries;
+  }
+
+  private candidateSymbolsForQuery(
+    byFirstChar: Map<string, SymbolRecord[]>,
+    fallback: SymbolRecord[],
+    lowered: string,
+  ): SymbolRecord[] {
+    if (!lowered) {
+      return fallback;
+    }
+    return byFirstChar.get(lowered[0]) ?? fallback;
+  }
+
+  inlayHintCache(uri: string, version: number): InlayHint[] | undefined {
+    const cached = this.view.inlayHintCache.get(uri);
+    if (cached && cached.version === version && cached.indexRevision === this.view.indexRevision) {
+      return cached.value;
+    }
+    return undefined;
   }
 
   semanticTokenCache(uri: string, version: number): SemanticTokens | undefined {
-    return this.state.getSemanticTokenCache(uri, version);
-  }
-
-  setSemanticTokenCache(uri: string, version: number, tokens: SemanticTokens): void {
-    this.state.setSemanticTokenCache(uri, version, tokens);
+    const cached = this.view.semanticTokenCache.get(uri);
+    if (cached && cached.version === version && cached.indexRevision === this.view.indexRevision) {
+      return cached.value;
+    }
+    return undefined;
   }
 }

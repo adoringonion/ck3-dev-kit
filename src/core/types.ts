@@ -14,6 +14,15 @@ export interface ParserError {
   range: Range;
 }
 
+export type TokenKind = "identifier" | "string" | "number" | "operator" | "brace" | "bracket";
+
+export interface ScriptToken {
+  kind: TokenKind;
+  value: string;
+  start: number;
+  end: number;
+}
+
 export type ScalarKind = "identifier" | "string" | "number" | "operator";
 
 export interface ScalarNode {
@@ -51,6 +60,7 @@ export interface ScriptDocument {
   range: Range;
   errors: ParserError[];
   text: string;
+  tokens: ScriptToken[];
 }
 
 export interface LocalizationEntry {
